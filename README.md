@@ -28,7 +28,7 @@ Without these settings, the B70 GPUs will not be detected by the OS.
 
 ```bash
 # Download
-wget https://raw.githubusercontent.com/YOUR_REPO/main/odin-b70-setup.sh
+wget https://raw.githubusercontent.com/Hal9000AIML/arc-pro-b70-inference-setup/main/odin-b70-setup.sh
 chmod +x odin-b70-setup.sh
 
 # Run (takes 15-30 minutes depending on internet speed)
