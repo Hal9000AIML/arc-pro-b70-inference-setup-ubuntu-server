@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+# =============================================================================
+# ODIN B70 Inference Server — Automated Setup Script v1.1.0
+#
+# Sets up Intel Arc Pro B70 GPUs for LLM inference with vLLM tensor parallelism.
+# Tested on Ubuntu Server 24.04 LTS with 2x and 4x B70 configurations.
+#
+# Hardware requirements:
+#   - 1-4x Intel Arc Pro B70 GPUs (32GB VRAM each)
+#   - 16GB+ system RAM
+#   - PCIe x16 slots (Gen 3.0+ works, Gen 5.0 optimal)
+#   - Ubuntu Server 24.04 LTS
+#
+# BIOS requirements (must be set manually before running this script):
+#   - Above 4G Decoding: ENABLED
+#   - Resizable BAR: ENABLED
+#   - CSM: DISABLED (UEFI boot only)
+#
+# Usage:
+#   chmod +x odin-b70-setup.sh
+#   sudo ./odin-b70-setup.sh
+#
+# After running, reboot and then:
+#   ~/boot_vllm.sh        # Start vLLM with tensor parallelism
+#   ~/start_llamacpp.sh   # Or start llama.cpp for single-GPU inference
+#
+# Based on testing by Level1Techs (550 tok/s on 4x B70)
+# =============================================================================
+set -euo pipefail
+
+SCRIPT_VERSION="1.1.0"
+LOG="/var/log/odin-b70-setup.log"
+
+# --- Configuration (edit these) ---
+VLLM_MODEL="Qwen/Qwen2.5-14B-Instruct"       # HuggingFace model for vLLM
+VLLM_MODEL_NAME="Qwen2.5-14B"                  # Served model name
+VLLM_PORT=8000                                  # vLLM API port
+LLAMACPP_PORT=8080                              # llama.cpp fallback port
+KERNEL_VERSION="6.17.0-20-generic"              # Minimum kernel for B70
+COMPUTE_RUNTIME_VERSION="26.09.37435.1"         # GitHub release tag
+IGC_VERSION="v2.30.1"                           # Intel Graphics Compiler
+VLLM_DOCKER_IMAGE="intel/vllm:0.17.0-xpu"      # The correct Docker image
+# ----------------------------------
+
+touch "$LOG" && chmod 600 "$LOG"
+exec > >(tee -a "$LOG") 2>&1
+echo "================================================================"
+echo "ODIN B70 Inference Server Setup v${SCRIPT_VERSION} — $(date)"
+echo "================================================================"
+
+# -----------------------------------------------------------
+# 0. Sanity checks
+# -----------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: Run as root: sudo ./odin-b70-setup.sh"
+    exit 1
+fi
+
+REAL_USER="${SUDO_USER:-}"
+if [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]]; then
+    echo "ERROR: Do not run as root directly. Use: sudo ./odin-b70-setup.sh"
+    echo "       The script needs SUDO_USER to identify your non-root account."
+    exit 1
+fi
+
+REAL_HOME=$(getent passwd "${REAL_USER}" | cut -d: -f6)
+if [[ -z "$REAL_HOME" || ! -d "$REAL_HOME" ]]; then
+    echo "ERROR: Could not determine home directory for user '${REAL_USER}'"
+    exit 1
+fi
+
+echo "User: ${REAL_USER} | Home: ${REAL_HOME}"
+echo ""
+
+# Check for B70 GPUs
+B70_COUNT=$(lspci | grep -c "Intel.*e223" 2>/dev/null || echo 0)
+if [[ "$B70_COUNT" -eq 0 ]]; then
+    echo "WARNING: No Intel Arc Pro B70 GPUs detected (device e223)."
+    echo "         Make sure BIOS has Above 4G Decoding and ReBAR enabled."
+    echo ""
+    read -p "Continue anyway? (y/N) " -n 1 -r
+    echo
+    [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+else
+    echo "Detected ${B70_COUNT}x Intel Arc Pro B70 GPU(s)"
+fi
+
+echo ""
+NEED_REBOOT=false
+
+# -----------------------------------------------------------
+# 1. System update & essential packages
+# -----------------------------------------------------------
+echo ">>> [1/9] System update & essentials"
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    build-essential cmake git curl wget \
+    htop lm-sensors \
+    pkg-config libssl-dev \
+    software-properties-common \
+    ca-certificates gpg \
+    python3 python3-pip python3-venv \
+    unzip pciutils lshw numactl \
+    clinfo glslang-tools \
+    vulkan-tools libvulkan-dev libvulkan1 \
+    mesa-vulkan-drivers
+echo "    Done."
+
+# -----------------------------------------------------------
+# 2. Install kernel 6.17+ (Battlemage xe driver support)
+# -----------------------------------------------------------
+echo ""
+echo ">>> [2/9] Kernel 6.17+ for Battlemage xe driver"
+
+CURRENT_KERNEL=$(uname -r)
+CURRENT_MAJOR=$(echo "$CURRENT_KERNEL" | cut -d. -f1)
+CURRENT_MINOR=$(echo "$CURRENT_KERNEL" | cut -d. -f2)
+
+if [[ "$CURRENT_MAJOR" -lt 6 ]] || [[ "$CURRENT_MAJOR" -eq 6 && "$CURRENT_MINOR" -lt 17 ]]; then
+    echo "    Current kernel: ${CURRENT_KERNEL} (too old for B70)"
+    echo "    Installing kernel ${KERNEL_VERSION}..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        "linux-image-${KERNEL_VERSION}" \
+        "linux-modules-${KERNEL_VERSION}" \
+        "linux-modules-extra-${KERNEL_VERSION}" 2>/dev/null || \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        "linux-image-unsigned-${KERNEL_VERSION}" \
+        "linux-modules-${KERNEL_VERSION}" \
+        "linux-modules-extra-${KERNEL_VERSION}" 2>/dev/null || {
+            echo "    WARNING: Could not install kernel ${KERNEL_VERSION}."
+            echo "    Searching for latest 6.17+ kernel..."
+            KERNEL_VERSION=$(apt-cache search linux-image | grep -E "6\.(1[7-9]|[2-9][0-9]).*generic" | grep -v unsigned | grep -v dbg | sort -V | tail -1 | awk '{print $1}' | sed 's/linux-image-//')
+            if [[ -n "$KERNEL_VERSION" ]]; then
+                echo "    Found: ${KERNEL_VERSION}"
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                    "linux-image-${KERNEL_VERSION}" \
+                    "linux-modules-${KERNEL_VERSION}" \
+                    "linux-modules-extra-${KERNEL_VERSION}"
+            else
+                echo "    ERROR: No 6.17+ kernel found. Add the HWE PPA or install manually."
+                exit 1
+            fi
+        }
+    NEED_REBOOT=true
+else
+    echo "    Current kernel: ${CURRENT_KERNEL} (OK)"
+fi
+
+# Set GRUB parameters
+if ! grep -q "iommu=pt" /etc/default/grub; then
+    cp /etc/default/grub /etc/default/grub.bak
+    # Restore backup on failure
+    trap 'cp /etc/default/grub.bak /etc/default/grub 2>/dev/null; echo "GRUB restored from backup"' ERR
+    CURRENT_CMDLINE=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT="//;s/"$//')
+    NEW_CMDLINE="${CURRENT_CMDLINE:+$CURRENT_CMDLINE }iommu=pt pci=realloc"
+    # Write the new line using python to avoid sed delimiter issues
+    NEW_CMDLINE="${NEW_CMDLINE}" python3 - << 'GRUBPY'
+import re, os
+new_val = os.environ['NEW_CMDLINE']
+with open('/etc/default/grub', 'r') as f:
+    content = f.read()
+content = re.sub(
+    r'^GRUB_CMDLINE_LINUX_DEFAULT=.*$',
+    f'GRUB_CMDLINE_LINUX_DEFAULT="{new_val}"',
+    content, flags=re.MULTILINE
+)
+with open('/etc/default/grub', 'w') as f:
+    f.write(content)
+GRUBPY
+    update-grub 2>&1 | tee -a "$LOG"
+    trap - ERR
+    echo "    GRUB: added iommu=pt pci=realloc"
+    NEED_REBOOT=true
+fi
+
+echo "    Done."
+
+# -----------------------------------------------------------
+# 3. Intel GPU drivers (compute-runtime from GitHub)
+# -----------------------------------------------------------
+echo ""
+echo ">>> [3/9] Intel GPU drivers (compute-runtime ${COMPUTE_RUNTIME_VERSION})"
+
+# Add Intel graphics APT repo for base packages
+mkdir -p /etc/apt/keyrings
+wget -qO- https://repositories.intel.com/gpu/intel-graphics.key | \
+    gpg --dearmor -o /etc/apt/keyrings/intel-graphics.gpg 2>/dev/null
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/intel-graphics.gpg] \
+https://repositories.intel.com/gpu/ubuntu noble unified" \
+    > /etc/apt/sources.list.d/intel-gpu.list
+apt-get update -qq
+
+# Install Level Zero loader
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq level-zero libze1 2>/dev/null || true
+
+# Install compute-runtime from GitHub (APT repo version doesn't support BMG e223)
+echo "    Downloading compute-runtime ${COMPUTE_RUNTIME_VERSION} from GitHub..."
+WORK_DIR=$(mktemp -d)
+cd "$WORK_DIR"
+
+CR_BASE="https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}"
+wget -q "${CR_BASE}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb"
+wget -q "${CR_BASE}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb"
+wget -q "${CR_BASE}/intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb"
+wget -q "${CR_BASE}/libigdgmm12_22.9.0_amd64.deb" || true
+
+echo "    Downloading IGC ${IGC_VERSION}..."
+IGC_BASE="https://github.com/intel/intel-graphics-compiler/releases/download/${IGC_VERSION}"
+IGC_TAG=$(echo "$IGC_VERSION" | sed 's/^v//')
+wget -q "${IGC_BASE}/intel-igc-core-2_${IGC_TAG}+20950_amd64.deb" || \
+wget -q "${IGC_BASE}/intel-igc-core_${IGC_TAG}_amd64.deb" || true
+wget -q "${IGC_BASE}/intel-igc-opencl-2_${IGC_TAG}+20950_amd64.deb" || \
+wget -q "${IGC_BASE}/intel-igc-opencl_${IGC_TAG}_amd64.deb" || true
+
+# Validate downloaded .deb files
+echo "    Validating packages..."
+for deb in *.deb; do
+    [[ -f "$deb" ]] || continue
+    if ! file "$deb" | grep -q "Debian binary package"; then
+        echo "    WARNING: $deb is not a valid Debian package, skipping"
+        rm -f "$deb"
+    fi
+done
+
+echo "    Installing..."
+# Remove conflicting old packages
+dpkg -r intel-opencl-icd libze-intel-gpu1 intel-ocloc libigc1 libigdfcl1 libigc2 libigdfcl2 2>/dev/null || true
+
+for deb in libigdgmm12_*.deb intel-igc-core*.deb intel-igc-opencl*.deb libze-intel-gpu1_*.deb intel-opencl-icd_*.deb intel-ocloc_*.deb; do
+    [[ -f "$deb" ]] || continue
+    dpkg -i "$deb" || echo "    WARNING: Failed to install $deb"
+done
+ldconfig
+
+cd /
+rm -rf "$WORK_DIR"
+
+# Add user to render and video groups
+usermod -aG render "${REAL_USER}" 2>/dev/null || true
+usermod -aG video "${REAL_USER}" 2>/dev/null || true
+
+echo "    Done."
+
+# -----------------------------------------------------------
+# 4. Docker
+# -----------------------------------------------------------
+echo ""
+echo ">>> [4/9] Docker"
+
+if ! command -v docker &>/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io
+    systemctl enable docker
+    systemctl start docker
+    echo "    Installed Docker $(docker --version | awk '{print $3}')"
+else
+    echo "    Docker already installed: $(docker --version | awk '{print $3}')"
+fi
+
+usermod -aG docker "${REAL_USER}" 2>/dev/null || true
+echo "    Done."
+
+# -----------------------------------------------------------
+# 5. Pull vLLM Docker image
+# -----------------------------------------------------------
+echo ""
+echo ">>> [5/9] Pulling ${VLLM_DOCKER_IMAGE}"
+echo "    This is ~8GB compressed, may take a few minutes..."
+
+if ! docker pull "${VLLM_DOCKER_IMAGE}"; then
+    echo "    ERROR: Failed to pull Docker image ${VLLM_DOCKER_IMAGE}"
+    echo "    Check your internet connection and try: docker pull ${VLLM_DOCKER_IMAGE}"
+    exit 1
+fi
+echo "    Done."
+
+# -----------------------------------------------------------
+# 6. Build llama.cpp (Vulkan, single-GPU fallback)
+# -----------------------------------------------------------
+echo ""
+echo ">>> [6/9] Building llama.cpp (Vulkan backend)"
+
+LLAMA_DIR="${REAL_HOME}/llama.cpp"
+if [[ -d "${LLAMA_DIR}" ]]; then
+    sudo -u "${REAL_USER}" git -C "${LLAMA_DIR}" pull -q
+else
+    sudo -u "${REAL_USER}" git clone -q https://github.com/ggerganov/llama.cpp.git "${LLAMA_DIR}"
+fi
+
+rm -rf "${LLAMA_DIR}/build"
+sudo -u "${REAL_USER}" cmake -S "${LLAMA_DIR}" -B "${LLAMA_DIR}/build" \
+    -DGGML_VULKAN=ON -DGGML_SYCL=OFF -DGGML_CUDA=OFF \
+    -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON 2>&1 | tail -1
+sudo -u "${REAL_USER}" cmake --build "${LLAMA_DIR}/build" --config Release -j$(nproc) 2>&1 | tail -1
+echo "    Built: ${LLAMA_DIR}/build/bin/llama-server"
+
+# -----------------------------------------------------------
+# 7. Download default model
+# -----------------------------------------------------------
+echo ""
+echo ">>> [7/9] Downloading model: ${VLLM_MODEL}"
+
+MODEL_DIR="${REAL_HOME}/models"
+MODEL_LOCAL_NAME=$(echo "$VLLM_MODEL" | tr '/' '-')
+MODEL_PATH="${MODEL_DIR}/${MODEL_LOCAL_NAME}"
+
+sudo -u "${REAL_USER}" mkdir -p "${MODEL_DIR}"
+
+if [[ -d "${MODEL_PATH}" ]] && [[ $(find "${MODEL_PATH}" -name "*.safetensors" 2>/dev/null | wc -l) -gt 0 ]]; then
+    echo "    Model already downloaded at ${MODEL_PATH}"
+else
+    echo "    Installing huggingface_hub..."
+    sudo -u "${REAL_USER}" pip install --break-system-packages -q huggingface_hub 2>/dev/null || \
+    pip install --break-system-packages -q huggingface_hub 2>/dev/null || true
+
+    echo "    Downloading (this may take a while)..."
+    VLLM_MODEL="${VLLM_MODEL}" MODEL_PATH="${MODEL_PATH}" \
+    sudo -u "${REAL_USER}" python3 - << 'PYEOF'
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(os.environ['VLLM_MODEL'], local_dir=os.environ['MODEL_PATH'])
+print('Download complete!')
+PYEOF
+fi
+
+echo "    Done."
+
+# -----------------------------------------------------------
+# 8. Create scripts and systemd services
+# -----------------------------------------------------------
+echo ""
+echo ">>> [8/9] Creating scripts and services"
+
+# Detect GPU count
+GPU_COUNT=$(lspci | grep -c "Intel.*e223" 2>/dev/null || echo 0)
+[[ "$GPU_COUNT" -eq 0 ]] && GPU_COUNT=2  # Default assumption
+
+# --- vLLM startup script ---
+cat > "${REAL_HOME}/start_vllm.sh" << VLLMSCRIPT
+#!/usr/bin/env bash
+# Start vLLM with tensor parallelism across all B70 GPUs
+GPU_COUNT=\$(lspci | grep -c "Intel.*e223" 2>/dev/null || echo ${GPU_COUNT})
+
+if ! docker ps --format '{{.Names}}' | grep -q '^vllm-b70\$'; then
+    echo "ERROR: Container vllm-b70 is not running. Run ${REAL_HOME}/boot_vllm.sh first."
+    exit 1
+fi
+
+docker exec -d vllm-b70 bash -c "
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export UR_L0_USE_IMMEDIATE_COMMANDLISTS=0
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export CCL_TOPO_P2P_ACCESS=0
+
+vllm serve /llm/models/${MODEL_LOCAL_NAME} \\
+  --served-model-name ${VLLM_MODEL_NAME} \\
+  --port ${VLLM_PORT} \\
+  --host 0.0.0.0 \\
+  --dtype bfloat16 \\
+  --enforce-eager \\
+  --disable-custom-all-reduce \\
+  --tensor-parallel-size \${GPU_COUNT} \\
+  --gpu-memory-util 0.5 \\
+  --block-size 64 \\
+  --max-model-len 4096 \\
+  --max-num-seqs 8 \\
+  --enable-chunked-prefill \\
+  --no-enable-prefix-caching \\
+  --trust-remote-code \\
+  > /tmp/vllm.log 2>&1
+"
+echo "vLLM starting (${VLLM_MODEL_NAME}, TP=\${GPU_COUNT})..."
+echo "Health check: curl http://localhost:${VLLM_PORT}/health"
+VLLMSCRIPT
+
+# --- Full boot script ---
+cat > "${REAL_HOME}/boot_vllm.sh" << BOOTEOF
+#!/usr/bin/env bash
+# Full boot: start Docker container, then vLLM server
+echo "Starting Docker container..."
+docker stop vllm-b70 2>/dev/null || true
+docker rm vllm-b70 2>/dev/null || true
+
+docker run -d --shm-size 32g --net=host --ipc=host \\
+  --device /dev/dri:/dev/dri \\
+  --group-add render \\
+  --group-add video \\
+  -v "${MODEL_DIR}:/llm/models" \\
+  --name=vllm-b70 \\
+  --entrypoint="" ${VLLM_DOCKER_IMAGE} sleep infinity
+
+sleep 5
+
+# Verify container is running
+if ! docker ps --format '{{.Names}}' | grep -q '^vllm-b70\$'; then
+    echo "ERROR: Container failed to start. Check: docker logs vllm-b70"
+    exit 1
+fi
+
+echo "Starting vLLM server..."
+${REAL_HOME}/start_vllm.sh
+
+echo "Waiting for vLLM health check..."
+for i in \$(seq 1 180); do
+    if curl -sf -o /dev/null http://127.0.0.1:${VLLM_PORT}/health 2>/dev/null; then
+        echo "vLLM READY after \$((i*2))s!"
+        echo "API: http://\$(hostname -I | awk '{print \$1}'):${VLLM_PORT}"
+        exit 0
+    fi
+    sleep 2
+done
+echo "WARNING: vLLM did not become ready within 360s."
+echo "Check logs: docker exec vllm-b70 tail -30 /tmp/vllm.log"
+BOOTEOF
+
+# --- llama.cpp startup script ---
+cat > "${REAL_HOME}/start_llamacpp.sh" << LLAMASCRIPT
+#!/usr/bin/env bash
+# Start llama.cpp Vulkan server (single-GPU, fast for GGUF models)
+MODEL="\${1:-\${HOME}/models/active_model.gguf}"
+[[ -f "\$MODEL" ]] || { echo "Model not found: \$MODEL"; echo "Usage: \$0 <path_to_gguf>"; exit 1; }
+echo "Starting llama.cpp Vulkan on port ${LLAMACPP_PORT}..."
+\${HOME}/llama.cpp/build/bin/llama-server \\
+    -m "\$MODEL" -ngl 99 \\
+    --flash-attn \\
+    --cache-type-k q8_0 --cache-type-v q8_0 \\
+    --host 0.0.0.0 --port ${LLAMACPP_PORT} \\
+    --ctx-size 4096 --parallel 4 --threads \$(nproc)
+LLAMASCRIPT
+
+# --- System info script ---
+cat > "${REAL_HOME}/sysinfo.sh" << SYSSCRIPT
+#!/usr/bin/env bash
+echo "=== ODIN Inference Server ==="
+echo "Hostname: \$(hostname)"
+echo "IP:       \$(hostname -I | awk '{print \$1}')"
+echo "Kernel:   \$(uname -r)"
+echo "Uptime:   \$(uptime -p)"
+echo "RAM:      \$(free -h | awk '/Mem:/{print \$3"/"\$2}')"
+echo "Disk:     \$(df -h / | awk 'NR==2{print \$3"/"\$2" ("\$5" used)"}')"
+echo ""
+echo "=== GPUs ==="
+lspci | grep -i "vga\|display\|3d"
+echo ""
+echo "=== GPU Temps ==="
+sensors 2>/dev/null | grep -A3 'xe-pci' || echo "(install lm-sensors or use kernel 6.17+)"
+echo ""
+echo "=== Vulkan Devices ==="
+vulkaninfo --summary 2>/dev/null | grep -A2 "deviceName" || echo "(not available)"
+echo ""
+echo "=== Services ==="
+docker ps --format "  vLLM Docker: {{.Names}} ({{.Status}})" 2>/dev/null || echo "  Docker: not running"
+if curl -sf -o /dev/null http://127.0.0.1:${VLLM_PORT}/health 2>/dev/null; then
+    echo "  vLLM API: healthy (port ${VLLM_PORT})"
+else
+    echo "  vLLM API: not running (port ${VLLM_PORT})"
+fi
+SYSSCRIPT
+
+# Set permissions
+for script in start_vllm boot_vllm start_llamacpp sysinfo; do
+    if [[ -f "${REAL_HOME}/${script}.sh" ]]; then
+        chmod +x "${REAL_HOME}/${script}.sh"
+        chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/${script}.sh"
+    fi
+done
+
+# --- Systemd service for Docker container ---
+cat > /etc/systemd/system/vllm-docker.service << EOF
+[Unit]
+Description=vLLM Docker Container (ODIN)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=300
+TimeoutStopSec=30
+ExecStartPre=-/usr/bin/docker stop vllm-b70
+ExecStartPre=-/usr/bin/docker rm vllm-b70
+ExecStart=/usr/bin/docker run -d --shm-size 32g --net=host --ipc=host --device /dev/dri:/dev/dri --group-add render --group-add video -v ${MODEL_DIR}:/llm/models --name=vllm-b70 --entrypoint= ${VLLM_DOCKER_IMAGE} sleep infinity
+ExecStop=/usr/bin/docker stop -t 15 vllm-b70
+ExecStopPost=-/usr/bin/docker rm vllm-b70
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable vllm-docker.service
+
+echo "    Done."
+
+# -----------------------------------------------------------
+# 9. Firewall & monitoring tools
+# -----------------------------------------------------------
+echo ""
+echo ">>> [9/9] Firewall & monitoring"
+
+if command -v ufw &>/dev/null; then
+    ufw allow 22/tcp comment "SSH" 2>/dev/null
+    ufw allow "${VLLM_PORT}/tcp" comment "vLLM API" 2>/dev/null
+    ufw allow "${LLAMACPP_PORT}/tcp" comment "llama.cpp" 2>/dev/null
+    ufw --force enable 2>/dev/null
+    echo "    Firewall: ports 22, ${VLLM_PORT}, ${LLAMACPP_PORT} open"
+fi
+
+# Install xpu-smi
+echo "    Installing xpu-smi..."
+XPUSMI_URL=$(curl -s https://api.github.com/repos/intel/xpumanager/releases/latest 2>/dev/null | \
+    python3 -c "import json,sys; [print(a['browser_download_url']) for a in json.load(sys.stdin).get('assets',[]) if 'u24' in a['name'] and a['name'].endswith('.deb')]" 2>/dev/null | head -1)
+if [[ -n "$XPUSMI_URL" && "$XPUSMI_URL" == https://github.com/intel/xpumanager/* ]]; then
+    XPUSMI_TMP=$(mktemp)
+    wget -q "$XPUSMI_URL" -O "$XPUSMI_TMP"
+    if file "$XPUSMI_TMP" | grep -q "Debian binary package"; then
+        dpkg -i "$XPUSMI_TMP" 2>/dev/null || apt-get install -f -y -qq 2>/dev/null
+        echo "    xpu-smi installed"
+    else
+        echo "    WARNING: Downloaded xpu-smi is not a valid .deb package"
+    fi
+    rm -f "$XPUSMI_TMP"
+else
+    echo "    WARNING: Could not find xpu-smi release. Install manually from github.com/intel/xpumanager/releases"
+fi
+
+echo "    Done."
+
+# -----------------------------------------------------------
+# Summary
+# -----------------------------------------------------------
+echo ""
+echo "================================================================"
+echo "ODIN B70 Setup Complete!"
+echo "================================================================"
+echo ""
+echo "System:"
+echo "  User:     ${REAL_USER}"
+echo "  Kernel:   $(uname -r)${NEED_REBOOT:+ (NEW KERNEL INSTALLED — REBOOT REQUIRED)}"
+echo "  GPUs:     ${B70_COUNT}x Intel Arc Pro B70"
+echo "  Docker:   ${VLLM_DOCKER_IMAGE}"
+echo "  Model:    ${VLLM_MODEL} at ${MODEL_PATH}"
+echo ""
+echo "Scripts:"
+echo "  ~/boot_vllm.sh        — Start everything (container + vLLM server)"
+echo "  ~/start_vllm.sh       — Start vLLM inside existing container"
+echo "  ~/start_llamacpp.sh   — Start llama.cpp Vulkan (single-GPU fallback)"
+echo "  ~/sysinfo.sh          — Show system status"
+echo ""
+echo "After boot:"
+echo "  API endpoint:  http://$(hostname -I | awk '{print $1}'):${VLLM_PORT}"
+echo "  Health check:  curl http://$(hostname -I | awk '{print $1}'):${VLLM_PORT}/health"
+echo ""
+echo "Test:"
+echo "  curl http://$(hostname -I | awk '{print $1}'):${VLLM_PORT}/v1/chat/completions \\"
+echo "    -H 'Content-Type: application/json' \\"
+echo "    -d '{\"model\":\"${VLLM_MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":100}'"
+echo ""
+
+if [[ "${NEED_REBOOT}" == "true" ]]; then
+    echo "================================================================"
+    echo "  REBOOT REQUIRED for new kernel and GRUB parameters!"
+    echo "  Run: sudo reboot"
+    echo "  Then: ~/boot_vllm.sh"
+    echo "================================================================"
+fi
+
+echo ""
+echo "Performance targets (2x B70, Qwen2.5-14B BF16, TP=2):"
+echo "  Single request:  ~19 tok/s"
+echo "  4 concurrent:    ~72 tok/s"
+echo "  8 concurrent:    ~140 tok/s"
+echo ""
+echo "Performance targets (4x B70, Qwen3.5-27B BF16, TP=4):"
+echo "  50 concurrent:   ~540 tok/s (Level1Techs benchmark)"
+echo ""
+echo "Log saved to: ${LOG}"
