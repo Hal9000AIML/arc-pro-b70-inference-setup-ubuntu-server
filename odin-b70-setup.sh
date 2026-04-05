@@ -524,8 +524,32 @@ else
 fi
 SYSSCRIPT
 
+# --- GPU thermal watchdog script ---
+cat > "${REAL_HOME}/gpu_thermal_watchdog.sh" << 'THERMALEOF'
+#!/usr/bin/env bash
+THRESHOLD=90
+LOG=/var/log/gpu_thermal.log
+while true; do
+    MAX_TEMP=0
+    while IFS= read -r line; do
+        case "$line" in *C*) ;; *) continue ;; esac
+        temp=$(echo "$line" | sed -n "s/.*+\([0-9]*\)\..*/\1/p")
+        if [ -n "$temp" ] && [ "$temp" -gt "$MAX_TEMP" ] 2>/dev/null; then
+            MAX_TEMP=$temp
+        fi
+    done < <(sensors 2>/dev/null | grep -E "^\s*(pkg|vram):" | grep -v MJ | grep -v W)
+    if [ "$MAX_TEMP" -gt 0 ] && [ "$MAX_TEMP" -ge "$THRESHOLD" ]; then
+        echo "$(date): CRITICAL GPU temp ${MAX_TEMP}C >= ${THRESHOLD}C stopping vLLM" | tee -a $LOG
+        docker exec vllm-b70 pkill -f "vllm serve" 2>/dev/null
+        docker stop vllm-b70 2>/dev/null
+        echo "$(date): vLLM stopped for thermal protection" | tee -a $LOG
+    fi
+    sleep 30
+done
+THERMALEOF
+
 # Set permissions
-for script in start_vllm boot_vllm start_llamacpp sysinfo; do
+for script in start_vllm boot_vllm start_llamacpp sysinfo gpu_thermal_watchdog; do
     if [[ -f "${REAL_HOME}/${script}.sh" ]]; then
         chmod +x "${REAL_HOME}/${script}.sh"
         chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/${script}.sh"
@@ -555,8 +579,26 @@ ExecStopPost=-/usr/bin/docker rm vllm-b70
 WantedBy=multi-user.target
 EOF
 
+# --- Systemd service for GPU thermal watchdog ---
+cat > /etc/systemd/system/gpu-thermal-watchdog.service << EOF
+[Unit]
+Description=GPU Thermal Watchdog (ODIN)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=${REAL_HOME}/gpu_thermal_watchdog.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable vllm-docker.service
+systemctl enable gpu-thermal-watchdog.service
 
 echo "    Done."
 
