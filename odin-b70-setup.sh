@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# ODIN B70 Inference Server — Automated Setup Script v1.1.0
+# Intel B70 Inference Server — Automated Setup Script v1.1.0
 #
 # Sets up Intel Arc Pro B70 GPUs for LLM inference with vLLM tensor parallelism.
 # Tested on Ubuntu Server 24.04 LTS with 2x and 4x B70 configurations.
@@ -45,7 +45,7 @@ VLLM_DOCKER_IMAGE="intel/vllm:0.17.0-xpu"      # The correct Docker image
 touch "$LOG" && chmod 600 "$LOG"
 exec > >(tee -a "$LOG") 2>&1
 echo "================================================================"
-echo "ODIN B70 Inference Server Setup v${SCRIPT_VERSION} — $(date)"
+echo "Intel B70 Inference Server Setup v${SCRIPT_VERSION} — $(date)"
 echo "================================================================"
 
 # -----------------------------------------------------------
@@ -532,7 +532,7 @@ echo "    Done."
 # -----------------------------------------------------------
 echo ""
 echo "================================================================"
-echo "ODIN B70 Setup Complete!"
+echo "Intel B70 Setup Complete!"
 echo "================================================================"
 echo ""
 echo "System:"

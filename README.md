@@ -1,4 +1,4 @@
-# ODIN B70 — Intel Arc Pro B70 LLM Inference Server
+# Intel B70 — Intel Arc Pro B70 LLM Inference Server
 
 Automated setup script for running LLM inference on Intel Arc Pro B70 GPUs with vLLM tensor parallelism.
 
