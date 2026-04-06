@@ -411,6 +411,15 @@ if ! docker ps --format '{{.Names}}' | grep -q '^vllm-b70\$'; then
     exit 1
 fi
 
+# Idempotency guard: if vllm is already running inside the container, do
+# nothing. Without this, vllm-serve.service and the watchdog can both call
+# this script and spawn duplicate vllm processes, which deadlock fighting
+# for XPU memory.
+if docker exec vllm-b70 pgrep -f 'vllm serve' >/dev/null 2>&1; then
+    echo "vLLM already running inside vllm-b70 — skipping start"
+    exit 0
+fi
+
 docker exec -d vllm-b70 bash -c "
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export UR_L0_USE_IMMEDIATE_COMMANDLISTS=0
