@@ -439,6 +439,34 @@ echo "vLLM starting (${VLLM_MODEL_NAME}, TP=\${GPU_COUNT})..."
 echo "Health check: curl http://localhost:${VLLM_PORT}/health"
 VLLMSCRIPT
 
+# --- vLLM graceful stop script ---
+# Without this, restarting vllm-serve leaves the old vllm process AND its
+# leaked /dev/shm segments alive — XPU VRAM never frees and the new vllm
+# fails with "Free memory on device xpu:0 (0.02/30.3 GiB)".
+cat > "${REAL_HOME}/stop_vllm.sh" << 'STOPSCRIPT'
+#!/usr/bin/env bash
+# Gracefully stop vLLM inside the container so XPU VRAM and shared memory
+# segments are released. SIGKILL leaks shm; SIGTERM lets vLLM clean up.
+if ! docker ps --format '{{.Names}}' | grep -q '^vllm-b70$'; then
+    exit 0
+fi
+docker exec vllm-b70 bash -c '
+  pids=$(pgrep -f "vllm serve" || true)
+  if [ -n "$pids" ]; then
+    kill -TERM $pids 2>/dev/null || true
+    for i in $(seq 1 30); do
+      pgrep -f "vllm serve" >/dev/null || break
+      sleep 1
+    done
+    pkill -9 -f "vllm serve" 2>/dev/null || true
+  fi
+  # Sweep leaked POSIX shm segments left behind by vLLM workers
+  rm -f /dev/shm/psm_* /dev/shm/vllm_* 2>/dev/null || true
+' || true
+STOPSCRIPT
+chmod +x "${REAL_HOME}/stop_vllm.sh"
+chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/stop_vllm.sh"
+
 # --- Full boot script ---
 cat > "${REAL_HOME}/boot_vllm.sh" << BOOTEOF
 #!/usr/bin/env bash
@@ -650,8 +678,30 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
+# --- Systemd service for vLLM serve (with graceful stop) ---
+cat > /etc/systemd/system/vllm-serve.service << EOF
+[Unit]
+Description=vLLM Model Server (inside Docker container)
+After=vllm-docker.service
+Requires=vllm-docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStopSec=60
+ExecStartPre=/bin/sleep 10
+ExecStart=${REAL_HOME}/start_vllm.sh
+ExecStop=${REAL_HOME}/stop_vllm.sh
+# Health check: wait up to 5 min for vLLM to respond
+ExecStartPost=/bin/bash -c 'for i in \$(seq 1 60); do curl -s http://127.0.0.1:${VLLM_PORT}/health && exit 0; sleep 5; done; echo "vLLM health timeout"'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable vllm-docker.service
+systemctl enable vllm-serve.service
 systemctl enable gpu-thermal-watchdog.service
 systemctl enable vllm-watchdog.service
 
