@@ -28,7 +28,7 @@
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 LOG="/var/log/odin-b70-setup.log"
 
 # --- Configuration (edit these) ---
@@ -448,6 +448,7 @@ docker stop vllm-b70 2>/dev/null || true
 docker rm vllm-b70 2>/dev/null || true
 
 docker run -d --privileged --shm-size 32g --net=host --ipc=host \\
+  --restart=unless-stopped \\
   -v "${MODEL_DIR}:/llm/models" \\
   --name=vllm-b70 \\
   --entrypoint="" ${VLLM_DOCKER_IMAGE} sleep infinity
@@ -571,9 +572,8 @@ TimeoutStartSec=300
 TimeoutStopSec=30
 ExecStartPre=-/usr/bin/docker stop vllm-b70
 ExecStartPre=-/usr/bin/docker rm vllm-b70
-ExecStart=/usr/bin/docker run -d --privileged --shm-size 32g --net=host --ipc=host -v ${MODEL_DIR}:/llm/models --name=vllm-b70 --entrypoint= ${VLLM_DOCKER_IMAGE} sleep infinity
+ExecStart=/usr/bin/docker run -d --privileged --shm-size 32g --net=host --ipc=host --restart=unless-stopped -v ${MODEL_DIR}:/llm/models --name=vllm-b70 --entrypoint= ${VLLM_DOCKER_IMAGE} sleep infinity
 ExecStop=/usr/bin/docker stop -t 15 vllm-b70
-ExecStopPost=-/usr/bin/docker rm vllm-b70
 
 [Install]
 WantedBy=multi-user.target
@@ -596,9 +596,64 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
+# --- vLLM watchdog script (auto-restart on crash) ---
+cat > "${REAL_HOME}/watchdog_vllm.sh" << WATCHEOF
+#!/usr/bin/env bash
+# vLLM Watchdog — restarts vLLM if container or process crashes
+LOG=${REAL_HOME}/watchdog.log
+echo "\$(date): Watchdog started" >> \$LOG
+
+while true; do
+    # Check if container is running
+    if ! docker ps --format '{{.Names}}' | grep -q '^vllm-b70\$'; then
+        echo "\$(date): Container down, restarting..." >> \$LOG
+        sudo docker start vllm-b70 2>/dev/null || true
+        sleep 5
+    fi
+
+    # Check if vLLM process is running inside container
+    VLLM_PID=\$(docker exec vllm-b70 pgrep -f 'vllm serve' 2>/dev/null)
+    if [ -z "\$VLLM_PID" ]; then
+        echo "\$(date): vLLM not running, starting..." >> \$LOG
+        ${REAL_HOME}/start_vllm.sh
+        # Wait for model to load (up to 10 min for swap-heavy systems)
+        for i in \$(seq 1 300); do
+            if curl -sf http://127.0.0.1:${VLLM_PORT}/health >/dev/null 2>&1; then
+                echo "\$(date): vLLM healthy after \$((i*2))s" >> \$LOG
+                break
+            fi
+            sleep 2
+        done
+    fi
+
+    sleep 30
+done
+WATCHEOF
+chmod +x "${REAL_HOME}/watchdog_vllm.sh"
+chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/watchdog_vllm.sh"
+
+# --- Systemd service for vLLM watchdog ---
+cat > /etc/systemd/system/vllm-watchdog.service << EOF
+[Unit]
+Description=vLLM Watchdog — auto-restart on crash (ODIN)
+After=docker.service vllm-docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=${REAL_USER}
+ExecStart=${REAL_HOME}/watchdog_vllm.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable vllm-docker.service
 systemctl enable gpu-thermal-watchdog.service
+systemctl enable vllm-watchdog.service
 
 echo "    Done."
 
@@ -656,6 +711,11 @@ echo "  ~/boot_vllm.sh        — Start everything (container + vLLM server)"
 echo "  ~/start_vllm.sh       — Start vLLM inside existing container"
 echo "  ~/start_llamacpp.sh   — Start llama.cpp Vulkan (single-GPU fallback)"
 echo "  ~/sysinfo.sh          — Show system status"
+echo ""
+echo "Auto-recovery (survives reboots and crashes):"
+echo "  vllm-docker.service   — Auto-starts container on boot"
+echo "  vllm-watchdog.service — Monitors and restarts vLLM if it crashes"
+echo "  gpu-thermal-watchdog  — Stops vLLM if GPU temp exceeds 90C"
 echo ""
 echo "After boot:"
 echo "  API endpoint:  http://$(hostname -I | awk '{print $1}'):${VLLM_PORT}"
