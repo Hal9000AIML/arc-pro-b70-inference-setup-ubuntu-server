@@ -427,7 +427,7 @@ vllm serve /llm/models/${MODEL_LOCAL_NAME} \\
   --tensor-parallel-size \${GPU_COUNT} \\
   --gpu-memory-util 0.85 \\
   --block-size 64 \\
-  --max-model-len 4096 \\
+  --max-model-len 32768 \\
   --max-num-seqs 8 \\
   --enable-chunked-prefill \\
   --no-enable-prefix-caching \\
