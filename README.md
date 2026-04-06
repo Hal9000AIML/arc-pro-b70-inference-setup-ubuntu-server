@@ -1,4 +1,7 @@
-# Intel B70 — Intel Arc Pro B70 LLM Inference Server
+# Intel Arc Pro B70 LLM Inference Server — Ubuntu Server Edition
+
+> **Ubuntu Server 24.04 LTS** install. For the Windows installer, see
+> [arc-pro-b70-inference-setup-windows](https://github.com/Hal9000AIML/arc-pro-b70-inference-setup-windows).
 
 Automated setup script for running LLM inference on Intel Arc Pro B70 GPUs with vLLM tensor parallelism.
 
