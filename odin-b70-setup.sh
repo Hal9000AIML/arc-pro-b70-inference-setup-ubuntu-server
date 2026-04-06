@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Intel B70 Inference Server — Automated Setup Script v1.1.0
+# Intel B70 Inference Server — Automated Setup Script v1.2.0
 #
 # Sets up Intel Arc Pro B70 GPUs for LLM inference with vLLM tensor parallelism.
 # Tested on Ubuntu Server 24.04 LTS with 2x and 4x B70 configurations.
 #
 # Hardware requirements:
 #   - 1-4x Intel Arc Pro B70 GPUs (32GB VRAM each)
-#   - 16GB+ system RAM
+#   - 64GB+ system RAM (128GB recommended for large MoE models)
 #   - PCIe x16 slots (Gen 3.0+ works, Gen 5.0 optimal)
 #   - Ubuntu Server 24.04 LTS
 #
@@ -28,18 +28,18 @@
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.3.0"
 LOG="/var/log/odin-b70-setup.log"
 
 # --- Configuration (edit these) ---
-VLLM_MODEL="Qwen/Qwen2.5-14B-Instruct"       # HuggingFace model for vLLM
-VLLM_MODEL_NAME="Qwen2.5-14B"                  # Served model name
+VLLM_MODEL="google/gemma-4-26B-A4B-it"             # HuggingFace model for vLLM
+VLLM_MODEL_NAME="gemma-4-26B-A4B"                   # Served model name
 VLLM_PORT=8000                                  # vLLM API port
 LLAMACPP_PORT=8080                              # llama.cpp fallback port
 KERNEL_VERSION="6.17.0-20-generic"              # Minimum kernel for B70
 COMPUTE_RUNTIME_VERSION="26.09.37435.1"         # GitHub release tag
 IGC_VERSION="v2.30.1"                           # Intel Graphics Compiler
-VLLM_DOCKER_IMAGE="intel/vllm:0.17.0-xpu"      # The correct Docker image
+VLLM_DOCKER_IMAGE="vllm-xpu:local"             # Built from source for Gemma 4 support
 # ----------------------------------
 
 touch "$LOG" && chmod 600 "$LOG"
@@ -91,7 +91,7 @@ NEED_REBOOT=false
 # -----------------------------------------------------------
 # 1. System update & essential packages
 # -----------------------------------------------------------
-echo ">>> [1/9] System update & essentials"
+echo ">>> [1/11] System update & essentials"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
@@ -111,7 +111,7 @@ echo "    Done."
 # 2. Install kernel 6.17+ (Battlemage xe driver support)
 # -----------------------------------------------------------
 echo ""
-echo ">>> [2/9] Kernel 6.17+ for Battlemage xe driver"
+echo ">>> [2/11] Kernel 6.17+ for Battlemage xe driver"
 
 CURRENT_KERNEL=$(uname -r)
 CURRENT_MAJOR=$(echo "$CURRENT_KERNEL" | cut -d. -f1)
@@ -180,7 +180,7 @@ echo "    Done."
 # 3. Intel GPU drivers (compute-runtime from GitHub)
 # -----------------------------------------------------------
 echo ""
-echo ">>> [3/9] Intel GPU drivers (compute-runtime ${COMPUTE_RUNTIME_VERSION})"
+echo ">>> [3/11] Intel GPU drivers (compute-runtime ${COMPUTE_RUNTIME_VERSION})"
 
 # Add Intel graphics APT repo for base packages
 mkdir -p /etc/apt/keyrings
@@ -246,7 +246,7 @@ echo "    Done."
 # 4. Docker
 # -----------------------------------------------------------
 echo ""
-echo ">>> [4/9] Docker"
+echo ">>> [4/11] Docker"
 
 if ! command -v docker &>/dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io
@@ -258,27 +258,53 @@ else
 fi
 
 usermod -aG docker "${REAL_USER}" 2>/dev/null || true
+
+# Install Docker buildx (required for building vLLM from source)
+if ! docker buildx version &>/dev/null; then
+    echo "    Installing Docker buildx..."
+    mkdir -p "${REAL_HOME}/.docker/cli-plugins"
+    curl -sL "https://github.com/docker/buildx/releases/download/v0.23.0/buildx-v0.23.0.linux-amd64" \
+        -o "${REAL_HOME}/.docker/cli-plugins/docker-buildx"
+    chmod +x "${REAL_HOME}/.docker/cli-plugins/docker-buildx"
+    chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/.docker/cli-plugins/docker-buildx"
+    echo "    Buildx installed: $(docker buildx version)"
+else
+    echo "    Docker buildx already installed"
+fi
 echo "    Done."
 
 # -----------------------------------------------------------
-# 5. Pull vLLM Docker image
+# 5. Build vLLM Docker image from source (Gemma 4 support)
 # -----------------------------------------------------------
 echo ""
-echo ">>> [5/9] Pulling ${VLLM_DOCKER_IMAGE}"
-echo "    This is ~8GB compressed, may take a few minutes..."
+echo ">>> [5/11] Building vLLM XPU Docker image from source"
+echo "    This builds from vLLM main branch for latest model support."
+echo "    This will take 30-60 minutes..."
 
-if ! docker pull "${VLLM_DOCKER_IMAGE}"; then
-    echo "    ERROR: Failed to pull Docker image ${VLLM_DOCKER_IMAGE}"
-    echo "    Check your internet connection and try: docker pull ${VLLM_DOCKER_IMAGE}"
-    exit 1
+VLLM_BUILD_DIR=$(mktemp -d)
+cd "$VLLM_BUILD_DIR"
+sudo -u "${REAL_USER}" git clone --depth 1 https://github.com/vllm-project/vllm.git .
+
+if ! docker buildx build -f docker/Dockerfile.xpu -t "${VLLM_DOCKER_IMAGE}" --target vllm-openai --load . 2>&1 | tee -a "$LOG"; then
+    echo "    ERROR: vLLM Docker build failed"
+    echo "    Falling back to pre-built image..."
+    docker pull intel/vllm:0.17.0-xpu
+    VLLM_DOCKER_IMAGE="intel/vllm:0.17.0-xpu"
 fi
+
+# Upgrade transformers inside container for Gemma 4 architecture support
+echo "    Upgrading transformers for Gemma 4 support..."
+docker run --rm "${VLLM_DOCKER_IMAGE}" pip install 'transformers>=4.59' 2>/dev/null || true
+
+cd /
+rm -rf "$VLLM_BUILD_DIR"
 echo "    Done."
 
 # -----------------------------------------------------------
 # 6. Build llama.cpp (Vulkan, single-GPU fallback)
 # -----------------------------------------------------------
 echo ""
-echo ">>> [6/9] Building llama.cpp (Vulkan backend)"
+echo ">>> [6/11] Building llama.cpp (Vulkan backend)"
 
 LLAMA_DIR="${REAL_HOME}/llama.cpp"
 if [[ -d "${LLAMA_DIR}" ]]; then
@@ -298,7 +324,7 @@ echo "    Built: ${LLAMA_DIR}/build/bin/llama-server"
 # 7. Download default model
 # -----------------------------------------------------------
 echo ""
-echo ">>> [7/9] Downloading model: ${VLLM_MODEL}"
+echo ">>> [7/11] Downloading model: ${VLLM_MODEL}"
 
 MODEL_DIR="${REAL_HOME}/models"
 MODEL_LOCAL_NAME=$(echo "$VLLM_MODEL" | tr '/' '-')
@@ -326,10 +352,49 @@ fi
 echo "    Done."
 
 # -----------------------------------------------------------
-# 8. Create scripts and systemd services
+# 8. Create chat template and swap file
 # -----------------------------------------------------------
 echo ""
-echo ">>> [8/9] Creating scripts and services"
+echo ">>> [8/11] Chat template and swap configuration"
+
+# Create Gemma 4 chat template (required by transformers 5.x)
+cat > "${MODEL_PATH}/chat_template.jinja" << 'CHATEOF'
+{{ bos_token }}{% for message in messages %}{% if message['role'] == 'system' %}<start_of_turn>system
+{{ message['content'] }}<end_of_turn>
+{% elif message['role'] == 'user' %}<start_of_turn>user
+{{ message['content'] }}<end_of_turn>
+{% elif message['role'] == 'assistant' %}<start_of_turn>model
+{{ message['content'] }}<end_of_turn>
+{% endif %}{% endfor %}<start_of_turn>model
+CHATEOF
+chown "${REAL_USER}:${REAL_USER}" "${MODEL_PATH}/chat_template.jinja"
+echo "    Chat template created"
+
+# Create swap file if RAM < 64GB (needed for mmap of large model shards)
+TOTAL_RAM_GB=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
+if [[ "$TOTAL_RAM_GB" -lt 64 ]]; then
+    SWAP_SIZE=$((64 - TOTAL_RAM_GB + 16))
+    echo "    System has ${TOTAL_RAM_GB}GB RAM — creating ${SWAP_SIZE}GB swap file..."
+    if [[ ! -f /swapfile_vllm ]]; then
+        fallocate -l "${SWAP_SIZE}G" /swapfile_vllm
+        chmod 600 /swapfile_vllm
+        mkswap /swapfile_vllm
+        swapon /swapfile_vllm
+        echo "/swapfile_vllm none swap sw 0 0" >> /etc/fstab
+        echo "    Swap file created and enabled (persistent across reboots)"
+    else
+        echo "    Swap file already exists"
+    fi
+else
+    echo "    System has ${TOTAL_RAM_GB}GB RAM — no extra swap needed"
+fi
+echo "    Done."
+
+# -----------------------------------------------------------
+# 9. Create scripts and systemd services
+# -----------------------------------------------------------
+echo ""
+echo ">>> [9/11] Creating scripts and services"
 
 # Detect GPU count
 GPU_COUNT=$(lspci | grep -c "Intel.*e223" 2>/dev/null || echo 0)
@@ -360,14 +425,15 @@ vllm serve /llm/models/${MODEL_LOCAL_NAME} \\
   --enforce-eager \\
   --disable-custom-all-reduce \\
   --tensor-parallel-size \${GPU_COUNT} \\
-  --gpu-memory-util 0.5 \\
+  --gpu-memory-util 0.85 \\
   --block-size 64 \\
   --max-model-len 4096 \\
   --max-num-seqs 8 \\
   --enable-chunked-prefill \\
   --no-enable-prefix-caching \\
   --trust-remote-code \\
-  > /tmp/vllm.log 2>&1
+  --chat-template /llm/models/${MODEL_LOCAL_NAME}/chat_template.jinja \\
+  2>&1 | tee /tmp/vllm.log
 "
 echo "vLLM starting (${VLLM_MODEL_NAME}, TP=\${GPU_COUNT})..."
 echo "Health check: curl http://localhost:${VLLM_PORT}/health"
@@ -381,10 +447,8 @@ echo "Starting Docker container..."
 docker stop vllm-b70 2>/dev/null || true
 docker rm vllm-b70 2>/dev/null || true
 
-docker run -d --shm-size 32g --net=host --ipc=host \\
-  --device /dev/dri:/dev/dri \\
-  --group-add render \\
-  --group-add video \\
+docker run -d --privileged --shm-size 32g --net=host --ipc=host \\
+  --restart=unless-stopped \\
   -v "${MODEL_DIR}:/llm/models" \\
   --name=vllm-b70 \\
   --entrypoint="" ${VLLM_DOCKER_IMAGE} sleep infinity
@@ -396,6 +460,10 @@ if ! docker ps --format '{{.Names}}' | grep -q '^vllm-b70\$'; then
     echo "ERROR: Container failed to start. Check: docker logs vllm-b70"
     exit 1
 fi
+
+# Upgrade transformers for Gemma 4 (needed until vLLM pins a compatible version)
+echo "Upgrading transformers..."
+docker exec vllm-b70 pip install -q 'transformers>=4.59' 2>/dev/null || true
 
 echo "Starting vLLM server..."
 ${REAL_HOME}/start_vllm.sh
@@ -457,8 +525,32 @@ else
 fi
 SYSSCRIPT
 
+# --- GPU thermal watchdog script ---
+cat > "${REAL_HOME}/gpu_thermal_watchdog.sh" << 'THERMALEOF'
+#!/usr/bin/env bash
+THRESHOLD=90
+LOG=/var/log/gpu_thermal.log
+while true; do
+    MAX_TEMP=0
+    while IFS= read -r line; do
+        case "$line" in *C*) ;; *) continue ;; esac
+        temp=$(echo "$line" | sed -n "s/.*+\([0-9]*\)\..*/\1/p")
+        if [ -n "$temp" ] && [ "$temp" -gt "$MAX_TEMP" ] 2>/dev/null; then
+            MAX_TEMP=$temp
+        fi
+    done < <(sensors 2>/dev/null | grep -E "^\s*(pkg|vram):" | grep -v MJ | grep -v W)
+    if [ "$MAX_TEMP" -gt 0 ] && [ "$MAX_TEMP" -ge "$THRESHOLD" ]; then
+        echo "$(date): CRITICAL GPU temp ${MAX_TEMP}C >= ${THRESHOLD}C stopping vLLM" | tee -a $LOG
+        docker exec vllm-b70 pkill -f "vllm serve" 2>/dev/null
+        docker stop vllm-b70 2>/dev/null
+        echo "$(date): vLLM stopped for thermal protection" | tee -a $LOG
+    fi
+    sleep 30
+done
+THERMALEOF
+
 # Set permissions
-for script in start_vllm boot_vllm start_llamacpp sysinfo; do
+for script in start_vllm boot_vllm start_llamacpp sysinfo gpu_thermal_watchdog; do
     if [[ -f "${REAL_HOME}/${script}.sh" ]]; then
         chmod +x "${REAL_HOME}/${script}.sh"
         chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/${script}.sh"
@@ -480,9 +572,79 @@ TimeoutStartSec=300
 TimeoutStopSec=30
 ExecStartPre=-/usr/bin/docker stop vllm-b70
 ExecStartPre=-/usr/bin/docker rm vllm-b70
-ExecStart=/usr/bin/docker run -d --shm-size 32g --net=host --ipc=host --device /dev/dri:/dev/dri --group-add render --group-add video -v ${MODEL_DIR}:/llm/models --name=vllm-b70 --entrypoint= ${VLLM_DOCKER_IMAGE} sleep infinity
+ExecStart=/usr/bin/docker run -d --privileged --shm-size 32g --net=host --ipc=host --restart=unless-stopped -v ${MODEL_DIR}:/llm/models --name=vllm-b70 --entrypoint= ${VLLM_DOCKER_IMAGE} sleep infinity
 ExecStop=/usr/bin/docker stop -t 15 vllm-b70
-ExecStopPost=-/usr/bin/docker rm vllm-b70
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# --- Systemd service for GPU thermal watchdog ---
+cat > /etc/systemd/system/gpu-thermal-watchdog.service << EOF
+[Unit]
+Description=GPU Thermal Watchdog (ODIN)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=${REAL_HOME}/gpu_thermal_watchdog.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# --- vLLM watchdog script (auto-restart on crash) ---
+cat > "${REAL_HOME}/watchdog_vllm.sh" << WATCHEOF
+#!/usr/bin/env bash
+# vLLM Watchdog — restarts vLLM if container or process crashes
+LOG=${REAL_HOME}/watchdog.log
+echo "\$(date): Watchdog started" >> \$LOG
+
+while true; do
+    # Check if container is running
+    if ! docker ps --format '{{.Names}}' | grep -q '^vllm-b70\$'; then
+        echo "\$(date): Container down, restarting..." >> \$LOG
+        sudo docker start vllm-b70 2>/dev/null || true
+        sleep 5
+    fi
+
+    # Check if vLLM process is running inside container
+    VLLM_PID=\$(docker exec vllm-b70 pgrep -f 'vllm serve' 2>/dev/null)
+    if [ -z "\$VLLM_PID" ]; then
+        echo "\$(date): vLLM not running, starting..." >> \$LOG
+        ${REAL_HOME}/start_vllm.sh
+        # Wait for model to load (up to 10 min for swap-heavy systems)
+        for i in \$(seq 1 300); do
+            if curl -sf http://127.0.0.1:${VLLM_PORT}/health >/dev/null 2>&1; then
+                echo "\$(date): vLLM healthy after \$((i*2))s" >> \$LOG
+                break
+            fi
+            sleep 2
+        done
+    fi
+
+    sleep 30
+done
+WATCHEOF
+chmod +x "${REAL_HOME}/watchdog_vllm.sh"
+chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/watchdog_vllm.sh"
+
+# --- Systemd service for vLLM watchdog ---
+cat > /etc/systemd/system/vllm-watchdog.service << EOF
+[Unit]
+Description=vLLM Watchdog — auto-restart on crash (ODIN)
+After=docker.service vllm-docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=${REAL_USER}
+ExecStart=${REAL_HOME}/watchdog_vllm.sh
+Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
@@ -490,14 +652,16 @@ EOF
 
 systemctl daemon-reload
 systemctl enable vllm-docker.service
+systemctl enable gpu-thermal-watchdog.service
+systemctl enable vllm-watchdog.service
 
 echo "    Done."
 
 # -----------------------------------------------------------
-# 9. Firewall & monitoring tools
+# 10. Firewall & monitoring tools
 # -----------------------------------------------------------
 echo ""
-echo ">>> [9/9] Firewall & monitoring"
+echo ">>> [10/11] Firewall & monitoring"
 
 if command -v ufw &>/dev/null; then
     ufw allow 22/tcp comment "SSH" 2>/dev/null
@@ -528,7 +692,7 @@ fi
 echo "    Done."
 
 # -----------------------------------------------------------
-# Summary
+# 11. Summary
 # -----------------------------------------------------------
 echo ""
 echo "================================================================"
@@ -547,6 +711,11 @@ echo "  ~/boot_vllm.sh        — Start everything (container + vLLM server)"
 echo "  ~/start_vllm.sh       — Start vLLM inside existing container"
 echo "  ~/start_llamacpp.sh   — Start llama.cpp Vulkan (single-GPU fallback)"
 echo "  ~/sysinfo.sh          — Show system status"
+echo ""
+echo "Auto-recovery (survives reboots and crashes):"
+echo "  vllm-docker.service   — Auto-starts container on boot"
+echo "  vllm-watchdog.service — Monitors and restarts vLLM if it crashes"
+echo "  gpu-thermal-watchdog  — Stops vLLM if GPU temp exceeds 90C"
 echo ""
 echo "After boot:"
 echo "  API endpoint:  http://$(hostname -I | awk '{print $1}'):${VLLM_PORT}"
@@ -567,12 +736,16 @@ if [[ "${NEED_REBOOT}" == "true" ]]; then
 fi
 
 echo ""
-echo "Performance targets (2x B70, Qwen2.5-14B BF16, TP=2):"
-echo "  Single request:  ~19 tok/s"
-echo "  4 concurrent:    ~72 tok/s"
-echo "  8 concurrent:    ~140 tok/s"
+echo "Performance targets (4x B70, Gemma 4 26B-A4B BF16, TP=4):"
+echo "  Single request:   ~25-35 tok/s (with 128GB RAM)"
+echo "  8 concurrent:     ~160-220 tok/s"
+echo "  128 concurrent:   ~480-540 tok/s (requires --max-num-seqs 128)"
 echo ""
-echo "Performance targets (4x B70, Qwen3.5-27B BF16, TP=4):"
-echo "  50 concurrent:   ~540 tok/s (Level1Techs benchmark)"
+echo "Performance targets (4x B70, Gemma 4 26B-A4B BF16, TP=4, 16GB RAM + swap):"
+echo "  Single request:   ~5.7 tok/s (swap-bottlenecked)"
+echo "  8 concurrent:     ~37 tok/s"
+echo "  NOTE: Upgrade to 128GB DDR4-3200 for full performance"
+echo ""
+echo "GPU temps under load: 61-67C package, 62-68C VRAM (well within limits)"
 echo ""
 echo "Log saved to: ${LOG}"

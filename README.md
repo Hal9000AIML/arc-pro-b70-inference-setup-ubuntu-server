@@ -2,27 +2,68 @@
 
 Automated setup script for running LLM inference on Intel Arc Pro B70 GPUs with vLLM tensor parallelism.
 
-## Performance
+## Hardware
 
-| Config | Model | Single Request | 8 Concurrent |
-|--------|-------|---------------|--------------|
-| 2x B70 (64GB) | Qwen2.5-14B BF16 | 19 tok/s | **140 tok/s** |
-| 4x B70 (128GB) | Qwen3.5-27B BF16 | ~14 tok/s | **540 tok/s** |
+| Component | Spec |
+|-----------|------|
+| **Motherboard** | ASUS ROG Zenith Extreme X399 |
+| **CPU** | AMD Threadripper 1900X (8c/16t) |
+| **RAM** | 16GB DDR4-3200 (upgrading to 128GB 4x32GB DDR4-3200) |
+| **GPUs** | 4x Intel Arc Pro B70 (128GB VRAM total, 32GB each) |
+| **Boot Drive** | 256GB NVMe |
+| **Model Storage** | 4TB SSD (arriving) |
+| **PSU** | EVGA SuperNOVA 1600 G+ |
+| **Case** | Phanteks Enthoo Pro |
+| **OS** | Ubuntu Server 24.04 LTS, kernel 6.17+ |
 
-## Requirements
+### BIOS Settings (required)
+- Above 4G Decoding: **ENABLED**
+- Resizable BAR: **ENABLED**
+- CSM: **DISABLED** (UEFI only)
+- IOMMU: **ENABLED**
+- SR-IOV: **ENABLED**
+- PCIE_X8/X4_4: **X8 Mode**
+- Slow Mode switch on Zenith Extreme: **OFF** (causes PCIe link training failures)
 
-### Hardware
-- 1-4x Intel Arc Pro B70 GPUs ($949 each, 32GB VRAM)
-- 16GB+ system RAM (models live entirely in VRAM)
-- Motherboard with PCIe x16 slots
-- Ubuntu Server 24.04 LTS
+## Performance — Gemma 4 26B-A4B (MoE, 3.8B active params)
 
-### BIOS (must be set manually)
-- **Above 4G Decoding**: ENABLED
-- **Resizable BAR**: ENABLED
-- **CSM**: DISABLED (UEFI only)
+### Benchmarked: 4x B70, TP=4, 16GB RAM + 64GB swap
 
-Without these settings, the B70 GPUs will not be detected by the OS.
+| Concurrency | Aggregate tok/s | Per-request tok/s |
+|-------------|----------------|-------------------|
+| 1 | 5.7 | 5.7 |
+| 4 | 18.6 | ~5.5 |
+| 8 | 37.0 | ~5.2 |
+
+**Prompt throughput**: 290-544 tok/s | **GPU temps under load**: 63-71°C pkg, 64-74°C VRAM
+
+> **Note:** These results are swap-bottlenecked. The 16GB system RAM forces vLLM's scheduler and weight loading through NVMe swap at ~3-5 GB/s instead of DDR4 at ~85 GB/s.
+
+### Projected: 4x B70, TP=4, 128GB DDR4-3200 (quad-channel)
+
+| Concurrency | Estimated tok/s | Notes |
+|-------------|----------------|-------|
+| 1 | 25-35 | MoE with 3.8B active, 4 GPUs |
+| 4 | 90-120 | Linear scaling |
+| 8 | 160-220 | Approaching GPU compute bound |
+| 16 | 280-350 | MoE routing efficient |
+| 64 | 420-500 | Near peak throughput |
+| 128 | 480-540 | Level1Techs territory, `--max-num-seqs 128` |
+
+### Reference Benchmarks
+
+| Config | Model | Single | 8 Concurrent | Source |
+|--------|-------|--------|-------------|--------|
+| 2x B70, 16GB RAM | Qwen2.5-14B BF16, TP=2 | 19 tok/s | 140 tok/s | Measured |
+| 4x B70, 128GB RAM | Qwen3.5-27B BF16, TP=4 | ~30 tok/s | 540 tok/s | Level1Techs |
+| 4x B70, 16GB+swap | Gemma 4 26B-A4B BF16, TP=4 | 5.7 tok/s | 37 tok/s | Measured (swap-limited) |
+
+### Model Sizing for B70 Configurations
+
+| GPUs | Total VRAM | Max BF16 Model | Recommended |
+|------|-----------|----------------|-------------|
+| 2x B70 | 64GB | ~27B dense | Qwen2.5-14B-Instruct |
+| 4x B70 | 128GB | ~60B dense, ~120B MoE | Gemma 4 26B-A4B (50GB BF16, MoE) |
 
 ## Quick Start
 
@@ -31,7 +72,7 @@ Without these settings, the B70 GPUs will not be detected by the OS.
 wget https://raw.githubusercontent.com/Hal9000AIML/arc-pro-b70-inference-setup/main/odin-b70-setup.sh
 chmod +x odin-b70-setup.sh
 
-# Run (takes 15-30 minutes depending on internet speed)
+# Run (takes 30-60 minutes — builds vLLM from source)
 sudo ./odin-b70-setup.sh
 
 # Reboot (required for new kernel)
@@ -43,7 +84,7 @@ sudo reboot
 # Test from any machine on your network
 curl http://<SERVER_IP>:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"Qwen2.5-14B","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
+  -d '{"model":"gemma-4-26B-A4B","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
 ```
 
 ## What the Script Installs
@@ -51,46 +92,56 @@ curl http://<SERVER_IP>:8000/v1/chat/completions \
 1. **Kernel 6.17+** — Required for the `xe` driver to recognize Battlemage GPUs
 2. **Intel compute-runtime v26.09** — From GitHub, not the APT repo (which is too old for B70)
 3. **Intel Graphics Compiler v2.30.1** — Matching IGC version
-4. **Docker** — Container runtime for vLLM
-5. **`intel/vllm:0.17.0-xpu`** — The correct Docker image for B70 inference (NOT llm-scaler-vllm)
+4. **Docker + buildx** — Container runtime and build tools for vLLM
+5. **vLLM XPU (built from source)** — Latest main branch with Gemma 4 architecture support
 6. **llama.cpp (Vulkan)** — Single-GPU fallback at ~45 tok/s
-7. **Qwen2.5-14B-Instruct** — Default model (configurable at top of script)
-8. **xpu-smi** — GPU monitoring (power, frequency, VRAM usage)
-9. **Systemd service** — Auto-starts Docker container on boot
+7. **Gemma 4 26B-A4B** — Default model (MoE, 3.8B active params, 256K context)
+8. **Chat template** — Required by transformers 5.x for Gemma 4
+9. **xpu-smi** — GPU monitoring (power, frequency, VRAM usage)
+10. **Systemd services** — Auto-starts Docker container and thermal watchdog on boot
+11. **Swap file** — Auto-created for systems with <64GB RAM
 
 ## Architecture
 
 ```
-                    ┌─────────────────────────────┐
-                    │     Docker Container         │
-                    │   intel/vllm:0.17.0-xpu      │
-                    │                              │
-                    │   vLLM Server (port 8000)    │
-                    │   OpenAI-compatible API      │
-                    │                              │
-                    │   Tensor Parallel (TP=N)     │
-                    │   ┌────────┐  ┌────────┐    │
-                    │   │ B70 #1 │  │ B70 #2 │    │
-                    │   │ 32GB   │  │ 32GB   │    │
-                    │   └────────┘  └────────┘    │
-                    └─────────────────────────────┘
+                    ┌──────────────────────────────────────────┐
+                    │          Docker Container                │
+                    │     vllm-xpu:local (built from source)   │
+                    │                                          │
+                    │     vLLM Server (port 8000)              │
+                    │     OpenAI-compatible API                │
+                    │                                          │
+                    │     Tensor Parallel (TP=4)               │
+                    │   ┌────────┐  ┌────────┐               │
+                    │   │ B70 #1 │  │ B70 #2 │               │
+                    │   │ 32GB   │  │ 32GB   │               │
+                    │   ├────────┤  ├────────┤               │
+                    │   │ B70 #3 │  │ B70 #4 │               │
+                    │   │ 32GB   │  │ 32GB   │               │
+                    │   └────────┘  └────────┘               │
+                    │         128GB VRAM total                 │
+                    └──────────────────────────────────────────┘
                               │
                          Port 8000
                               │
                     ┌─────────────────┐
-                    │   Your App /    │
-                    │   Main PC /     │
+                    │   Trading Bots  │
+                    │   ODIN Agents   │
                     │   LAN Clients   │
                     └─────────────────┘
 ```
 
 ## Key Technical Details
 
-### Why `intel/vllm:0.17.0-xpu` and NOT `intel/llm-scaler-vllm`?
+### Why Build vLLM from Source?
 
-The `llm-scaler-vllm` image is built for Intel's Best Known Configuration (BKC) stack — Ubuntu 25.04, kernel 6.14, compute-runtime 25.22. Running it on Ubuntu 24.04 with kernel 6.17 and compute-runtime 26.09 causes SYCL worker crashes during tensor parallelism initialization.
+The pre-built `intel/vllm:0.17.0-xpu` image (March 26, 2026) predates Gemma 4's release (April 2, 2026). The `gemma4` architecture support was merged via PR #38826 on April 2. Building from the latest vLLM main branch includes this plus Intel's FusedMoE XPU kernels optimized for Arc Pro B-series.
 
-`intel/vllm:0.17.0-xpu` was released March 26, 2026 (one day after B70 launched) and is more tolerant of host driver versions. It also dropped the IPEX dependency in favor of `vllm-xpu-kernels v0.1.3`.
+The transformers library must also be upgraded to 5.x inside the container, as the Gemma 4 architecture is too new for the 4.x series that vLLM pins.
+
+### Why `--privileged` Container?
+
+The newer oneCCL (2021.15.7) requires access to Level Zero IPC device file descriptors for inter-GPU communication. Without `--privileged`, the `ze_fd_manager` fails with "could not open device directory" errors during TP initialization. The older `intel/vllm:0.17.0-xpu` image used a different oneCCL version that worked without `--privileged`.
 
 ### Critical vLLM Flags
 
@@ -101,6 +152,8 @@ The `llm-scaler-vllm` image is built for Intel's Best Known Configuration (BKC) 
 | `--block-size 64` | Tuned for Arc Pro XMX engines. |
 | `--enable-chunked-prefill` | Improves memory utilization and throughput. |
 | `--no-enable-prefix-caching` | Prefix caching can cause instability on XPU. |
+| `--chat-template` | **Required for Gemma 4.** Tokenizer lacks built-in chat template. |
+| `--gpu-memory-util 0.85` | Leaves headroom for KV cache growth under concurrency. |
 
 ### Critical Environment Variables
 
@@ -110,35 +163,36 @@ The `llm-scaler-vllm` image is built for Intel's Best Known Configuration (BKC) 
 | `UR_L0_USE_IMMEDIATE_COMMANDLISTS` | `0` | Prevents Level Zero command list issues. |
 | `CCL_TOPO_P2P_ACCESS` | `0` | USM mode — routes allreduce through system RAM. Faster than P2P on PCIe 3.0 without bifurcation. Set to `1` on PCIe 5.0 platforms with x8/x8 bifurcation. |
 
-### GRUB Parameters
+### RAM and Performance
 
-| Parameter | Why |
-|-----------|-----|
-| `iommu=pt` | Passthrough mode. Keeps IOMMU for WiFi/DMA devices but avoids overhead for GPUs. Do NOT use `iommu=off` — breaks WiFi cards with 32-bit DMA (e.g., QCA6174). |
-| `pci=realloc` | Allows kernel to reallocate PCIe BARs for large VRAM GPUs. |
+| RAM | Swap Needed | `--max-num-seqs` | Expected Generation tok/s (8 concurrent) |
+|-----|------------|-------------------|------------------------------------------|
+| 16GB | 64GB | 8 | ~37 (swap-bottlenecked) |
+| 32GB | 32GB | 16-32 | ~80-120 |
+| 64GB | None | 64 | ~200-350 |
+| 128GB | None | 128 | ~400-540 |
 
-### Model Sizing for 2x vs 4x B70
+The CPU-side scheduler, tokenization, and oneCCL USM inter-GPU traffic all flow through host RAM. With 16GB, these operations page through NVMe swap at 3-5 GB/s. DDR4-3200 quad-channel delivers ~85 GB/s — a 20x improvement.
 
-| GPUs | Total VRAM | Max BF16 Model | Recommended |
-|------|-----------|----------------|-------------|
-| 2x B70 | 64GB | ~14B parameters | Qwen2.5-14B-Instruct |
-| 4x B70 | 128GB | ~27B parameters | Qwen3.5-27B |
+### GPU Thermal Monitoring
 
-BF16 uses 2 bytes per parameter. A 14B model = 28GB, split across 2 GPUs = 14GB each, leaving ~18GB per GPU for KV cache and overhead.
+The script installs a systemd thermal watchdog (`gpu-thermal-watchdog.service`) that monitors all B70 GPUs every 30 seconds. If any GPU package or VRAM temperature reaches 90°C, it automatically stops vLLM for thermal protection.
 
-27B models OOM on TP=2 due to vLLM's memory overhead. Use TP=4 or INT4 quantization.
-
-## GPU Temperature Monitoring
+Observed temperatures under sustained load:
+- Idle: 52-58°C package, 56-62°C VRAM
+- Under load (8 concurrent): 63-71°C package, 64-74°C VRAM
+- Throttle point: ~95°C
+- Thermal shutdown: ~110°C
 
 ```bash
-# Via lm-sensors (requires kernel 6.17+)
+# Check temperatures
 sensors | grep -A3 'xe-pci'
 
-# Via xpu-smi
-xpu-smi stats -d 0
+# Check watchdog status
+sudo systemctl status gpu-thermal-watchdog
 
-# System overview
-~/sysinfo.sh
+# Check thermal log
+cat /var/log/gpu_thermal.log
 ```
 
 ## Fallback: llama.cpp Vulkan (Single GPU)
@@ -147,14 +201,14 @@ For single-GPU inference with GGUF models, llama.cpp Vulkan delivers ~45-100 tok
 
 ```bash
 # Download a GGUF model
-wget https://huggingface.co/unsloth/Nemotron-3-Nano-30B-A3B-GGUF/resolve/main/Nemotron-3-Nano-30B-A3B-Q4_K_M.gguf \
-  -O ~/models/nemotron-30b-q4.gguf
+wget https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-Q4_K_M.gguf \
+  -O ~/models/gemma4-26b-q4.gguf
 
 # Start
-~/start_llamacpp.sh ~/models/nemotron-30b-q4.gguf
+~/start_llamacpp.sh ~/models/gemma4-26b-q4.gguf
 ```
 
-Note: llama.cpp's Vulkan multi-GPU (layer split) is broken — sequential pipeline with ~4x slowdown. Use vLLM for multi-GPU.
+Note: llama.cpp's Vulkan multi-GPU (layer split) is broken — sequential pipeline with ~4x slowdown (bug #16767). Use vLLM for multi-GPU.
 
 ## Troubleshooting
 
@@ -163,16 +217,21 @@ Note: llama.cpp's Vulkan multi-GPU (layer split) is broken — sequential pipeli
 | GPUs not detected in `lspci` | Enable Above 4G Decoding + ReBAR in BIOS, disable CSM |
 | `xe` driver not loading | Need kernel 6.17+. Check with `lsmod \| grep xe` |
 | `FATAL: Unknown device: deviceId: e223` | Compute-runtime too old. Install v26.09+ from GitHub |
+| vLLM `gemma4` architecture not recognized | Upgrade transformers: `pip install 'transformers>=4.59'` |
+| vLLM `Cannot allocate memory` during model load | Need more RAM or swap. Script auto-creates swap for <64GB systems |
+| vLLM oneCCL `opendir failed` / `device_fd invalid` | Use `--privileged` container flag |
 | vLLM TP=2 crashes with OOM | Lower `--gpu-memory-util` to 0.5, reduce `--max-num-seqs` |
-| vLLM TP=2 SYCL worker crash | Use `intel/vllm:0.17.0-xpu`, not `llm-scaler-vllm` |
+| Thermal watchdog false trigger | Ensure watchdog filters MJ/W sensor lines (fixed in v1.2.1) |
 | WiFi broken after adding GPUs | Interface name changed. Check `ip link show` and update netplan |
 | WiFi broken with `iommu=off` | Use `iommu=pt` instead — keeps DMA working for 32-bit WiFi cards |
-| GPU temps not showing | Only works on kernel 6.17+ via `sensors` command |
+| Slow Mode switch causes POST code 99 | Turn OFF the Slow Mode switch on Zenith Extreme |
+| BIOS bricked after EFI variable write | Use BIOS Flashback to recover — CMOS clear does NOT reset EFI NVRAM |
 
 ## Credits
 
 - [Level1Techs](https://forum.level1techs.com/t/intel-b70-launch-unboxed-and-tested/247873) — 4x B70 benchmark (540 tok/s)
 - [vLLM Intel Arc Pro B-Series Blog](https://vllm.ai/blog/intel-arc-pro-b) — Intel's vLLM optimization work
+- [Run Gemma 4 on Intel Arc GPUs](https://huggingface.co/blog/MatrixYao/intel-gpu) — Intel's Day 0 Gemma 4 XPU guide
 - [intel/vllm](https://hub.docker.com/r/intel/vllm) — Docker images
 - [intel/compute-runtime](https://github.com/intel/compute-runtime) — GPU drivers
 
