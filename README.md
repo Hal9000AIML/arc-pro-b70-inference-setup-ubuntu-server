@@ -67,6 +67,39 @@ Automated setup script for running LLM inference on Intel Arc Pro B70 GPUs with 
 
 ## Quick Start
 
+There are two ways to bring up a fresh machine:
+
+### Option A — Bootable USB (recommended for clean hardware)
+
+Builds an Ubuntu 24.04 Server autoinstall USB that lays down the OS and runs
+the full stack setup automatically on first boot. No manual steps after disk
+selection.
+
+```bash
+# On any Linux box or WSL — install build deps once
+sudo apt-get install -y xorriso p7zip-full wget
+
+# Clone and build the ISO (downloads Ubuntu 24.04.2 ~3 GB on first run)
+git clone https://github.com/Hal9000AIML/arc-pro-b70-inference-setup.git
+cd arc-pro-b70-inference-setup
+bash build_iso.sh
+
+# Output: arc-pro-b70-autoinstall.iso (~3 GB)
+# Write to USB with Rufus (DD mode), Balena Etcher, or:
+sudo dd if=arc-pro-b70-autoinstall.iso of=/dev/sdX bs=4M status=progress oflag=sync
+```
+
+**On the target machine:**
+1. Boot from USB and select **"Install Intel Arc Pro B70 Inference Server (autoinstall)"** (default, 10s timeout)
+2. Installer runs unattended but **pauses on storage** so you confirm the target disk (protection against wiping the wrong machine)
+3. Reboots into Ubuntu 24.04 — login as `user` / `changeme`
+4. `prob70-firstboot.service` automatically runs `odin-b70-setup.sh`
+5. Watch progress: `sudo journalctl -fu prob70-firstboot`
+
+The first-boot service is idempotent — it touches `/var/lib/prob70/installed` on success and won't re-run on subsequent boots. Total time from USB boot to working vLLM endpoint: ~60-90 minutes (depending on internet speed for the Docker pull and vLLM build).
+
+### Option B — Manual install on existing Ubuntu
+
 ```bash
 # Download
 wget https://raw.githubusercontent.com/Hal9000AIML/arc-pro-b70-inference-setup/main/odin-b70-setup.sh
