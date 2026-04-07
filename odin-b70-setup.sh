@@ -236,27 +236,46 @@ ldconfig
 cd /
 rm -rf "$WORK_DIR"
 
-# GuC firmware update for Battlemage (linux-firmware package path)
-# Observed on 4x B70: with linux-firmware shipping GuC 70.44.1, all four GPUs
+# GuC + HuC firmware update for Battlemage
+#
+# Background: with linux-firmware shipping GuC 70.44.1, all four B70 GPUs
 # experienced blitter-engine (bcs) hangs requiring GuC engine resets under
 # sustained vLLM load, which cascaded into vLLM EngineCore RPC timeouts and
-# killed the API server. Newer linux-firmware packages ship GuC 70.45.2+
-# with stability fixes.
+# killed the API server. The kernel xe driver itself logs:
+#   "GuC firmware (70.45.2) is recommended, but only (70.44.1) was found"
 #
-# IMPORTANT: We use the distro linux-firmware package, NOT a direct fetch
-# from kernel.org. The firmware on kernel.org HEAD is often newer than what
-# the in-tree xe driver supports and is rejected with -EINVAL on load.
-# Intel also ships xe firmware as zstd-compressed .bin.zst files, and the
-# xe driver auto-decompresses them, so placing an uncompressed .bin next
-# to the .bin.zst will take precedence and can break loading if the .bin
-# is invalid.
-echo "    Refreshing linux-firmware package for GuC updates..."
-DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade -qq linux-firmware 2>/dev/null || \
-    echo "    NOTE: linux-firmware already at latest version available from distro"
-update-initramfs -u 2>/dev/null || true
-echo "    If kernel 6.17+ still warns about GuC 70.44.1, wait for the next"
-echo "    linux-firmware package update or consult the Intel compute-runtime"
-echo "    release notes for the specific GuC version required."
+# Verified working on production 4x B70 install: GuC 70.60.0 + HuC 8.2.10 from
+# linux-firmware.git HEAD, installed as zstd-compressed .bin.zst files.
+#
+# CRITICAL: the xe driver loads bmg_guc_70.bin.zst (compressed). Placing an
+# uncompressed bmg_guc_70.bin next to it will take precedence and crash all
+# GPUs with -EINVAL. ALWAYS install as .bin.zst, never as raw .bin.
+echo "    Updating GuC + HuC firmware from linux-firmware.git HEAD..."
+apt-get install -y --only-upgrade -qq linux-firmware >/dev/null 2>&1 || true
+apt-get install -y -qq zstd >/dev/null 2>&1
+FW_TMP=$(mktemp -d)
+LF_BASE="https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/xe"
+if curl -fsSLo "$FW_TMP/bmg_guc_70.bin" "$LF_BASE/bmg_guc_70.bin" && \
+   curl -fsSLo "$FW_TMP/bmg_huc.bin"   "$LF_BASE/bmg_huc.bin"; then
+    zstd -19 -q -f -o "$FW_TMP/bmg_guc_70.bin.zst" "$FW_TMP/bmg_guc_70.bin"
+    zstd -19 -q -f -o "$FW_TMP/bmg_huc.bin.zst"   "$FW_TMP/bmg_huc.bin"
+    mkdir -p /lib/firmware/xe
+    # Backup any existing files before overwriting
+    [[ -f /lib/firmware/xe/bmg_guc_70.bin.zst ]] && \
+        cp /lib/firmware/xe/bmg_guc_70.bin.zst /lib/firmware/xe/bmg_guc_70.bin.zst.bak.$(date +%s)
+    [[ -f /lib/firmware/xe/bmg_huc.bin.zst ]] && \
+        cp /lib/firmware/xe/bmg_huc.bin.zst /lib/firmware/xe/bmg_huc.bin.zst.bak.$(date +%s)
+    # CRITICAL: remove any uncompressed .bin that would shadow the .bin.zst
+    rm -f /lib/firmware/xe/bmg_guc_70.bin /lib/firmware/xe/bmg_huc.bin
+    install -m 644 "$FW_TMP/bmg_guc_70.bin.zst" /lib/firmware/xe/bmg_guc_70.bin.zst
+    install -m 644 "$FW_TMP/bmg_huc.bin.zst"   /lib/firmware/xe/bmg_huc.bin.zst
+    update-initramfs -u >/dev/null 2>&1 || true
+    echo "    GuC/HuC firmware updated. New versions will load on next boot."
+else
+    echo "    NOTE: Could not fetch firmware from linux-firmware.git (no internet?)."
+    echo "    Falling back to distro linux-firmware package."
+fi
+rm -rf "$FW_TMP"
 
 # Add user to render and video groups
 usermod -aG render "${REAL_USER}" 2>/dev/null || true
