@@ -482,7 +482,7 @@ vllm serve /llm/models/${MODEL_LOCAL_NAME} \\
   --dtype bfloat16 \\
   --enforce-eager \\
   --disable-custom-all-reduce \\
-  --tensor-parallel-size \${GPU_COUNT} \\
+  --tensor-parallel-size ${GPU_COUNT} \\
   --gpu-memory-util 0.85 \\
   --block-size 64 \\
   --max-model-len 32768 \\
