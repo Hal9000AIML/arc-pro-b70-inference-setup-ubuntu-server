@@ -236,30 +236,27 @@ ldconfig
 cd /
 rm -rf "$WORK_DIR"
 
-# GuC firmware update for Battlemage
+# GuC firmware update for Battlemage (linux-firmware package path)
 # Observed on 4x B70: with linux-firmware shipping GuC 70.44.1, all four GPUs
 # experienced blitter-engine (bcs) hangs requiring GuC engine resets under
-# sustained vLLM load, which cascaded into vLLM EngineCore RPC timeouts on
-# sample_tokens and killed the API server. Recommended GuC 70.45.2 contains
-# stability fixes. We pull it directly from kernel.org linux-firmware.git so
-# the version is pinned regardless of distro package lag.
-echo "    Updating Intel Battlemage GuC firmware to recommended 70.45.2..."
-GUC_URL="https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/xe/bmg_guc_70.bin"
-mkdir -p /lib/firmware/xe
-if wget -q -O /lib/firmware/xe/bmg_guc_70.bin.new "$GUC_URL"; then
-    if [[ -s /lib/firmware/xe/bmg_guc_70.bin.new ]]; then
-        [[ -f /lib/firmware/xe/bmg_guc_70.bin ]] && \
-            cp /lib/firmware/xe/bmg_guc_70.bin /lib/firmware/xe/bmg_guc_70.bin.old
-        mv /lib/firmware/xe/bmg_guc_70.bin.new /lib/firmware/xe/bmg_guc_70.bin
-        update-initramfs -u 2>/dev/null || true
-        echo "    GuC firmware updated. Reboot required to load new firmware."
-    else
-        rm -f /lib/firmware/xe/bmg_guc_70.bin.new
-        echo "    WARNING: GuC firmware download was empty — keeping distro version"
-    fi
-else
-    echo "    WARNING: could not fetch GuC firmware — keeping distro version"
-fi
+# sustained vLLM load, which cascaded into vLLM EngineCore RPC timeouts and
+# killed the API server. Newer linux-firmware packages ship GuC 70.45.2+
+# with stability fixes.
+#
+# IMPORTANT: We use the distro linux-firmware package, NOT a direct fetch
+# from kernel.org. The firmware on kernel.org HEAD is often newer than what
+# the in-tree xe driver supports and is rejected with -EINVAL on load.
+# Intel also ships xe firmware as zstd-compressed .bin.zst files, and the
+# xe driver auto-decompresses them, so placing an uncompressed .bin next
+# to the .bin.zst will take precedence and can break loading if the .bin
+# is invalid.
+echo "    Refreshing linux-firmware package for GuC updates..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade -qq linux-firmware 2>/dev/null || \
+    echo "    NOTE: linux-firmware already at latest version available from distro"
+update-initramfs -u 2>/dev/null || true
+echo "    If kernel 6.17+ still warns about GuC 70.44.1, wait for the next"
+echo "    linux-firmware package update or consult the Intel compute-runtime"
+echo "    release notes for the specific GuC version required."
 
 # Add user to render and video groups
 usermod -aG render "${REAL_USER}" 2>/dev/null || true
