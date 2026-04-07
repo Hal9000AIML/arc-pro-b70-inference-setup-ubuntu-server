@@ -480,10 +480,11 @@ vllm serve /llm/models/${MODEL_LOCAL_NAME} \\
   --port ${VLLM_PORT} \\
   --host 0.0.0.0 \\
   --dtype bfloat16 \\
+  --quantization fp8 \\
   --enforce-eager \\
   --disable-custom-all-reduce \\
   --tensor-parallel-size ${GPU_COUNT} \\
-  --gpu-memory-util 0.85 \\
+  --gpu-memory-util 0.65 \\
   --block-size 64 \\
   --max-model-len 32768 \\
   --max-num-seqs 8 \\
