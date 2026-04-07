@@ -696,6 +696,8 @@ done
 
 restart_vllm() {
     echo "\$(date): Triggering vLLM restart" >> \$LOG
+    # Capture full diagnostic snapshot before tearing down
+    /usr/local/bin/gpu_diag_logger.sh --on-failure >/dev/null 2>&1 || true
     "${REAL_HOME}/stop_vllm.sh" 2>>\$LOG || true
     sleep 3
     "${REAL_HOME}/start_vllm.sh" >>\$LOG 2>&1 || true
@@ -778,11 +780,77 @@ ExecStartPost=/bin/bash -c 'for i in \$(seq 1 60); do curl -s http://127.0.0.1:$
 WantedBy=multi-user.target
 EOF
 
+# --- GPU diagnostic logger ---
+# Captures comprehensive GPU and inference state to /var/log/gpu-diag/ so
+# intermittent issues (PCODE timeouts, xe driver init failures, oneCCL hangs,
+# vLLM EngineCore RPC timeouts) can be debugged after the fact. Reads dmesg,
+# /sys/class/drm, /sys/bus/pci, igsc, and the vLLM /health endpoint. Runs at
+# boot, every 5 minutes via systemd timer, and is hooked into the vLLM
+# watchdog's restart_vllm() function so a snapshot is captured at the
+# moment of failure.
+#
+# Files in /var/log/gpu-diag/:
+#   state.log         one-line per snapshot (lightweight, append-only)
+#   events.log        state-transition events (card count change, vllm down)
+#   detail-YYYY-MM-DD.log   per-day full detail dump (rotated after 14 days)
+#   dmesg-last.txt    full dmesg snapshot at the most recent failure
+SCRIPT_PATH="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)/gpu_diag_logger.sh"
+if [[ -f "\$SCRIPT_PATH" ]]; then
+    install -m755 "\$SCRIPT_PATH" /usr/local/bin/gpu_diag_logger.sh
+else
+    # Fallback: install from GitHub raw URL if running odin-b70-setup.sh standalone
+    curl -fsSL https://raw.githubusercontent.com/Hal9000AIML/arc-pro-b70-inference-setup/master/gpu_diag_logger.sh \
+        -o /usr/local/bin/gpu_diag_logger.sh
+    chmod 755 /usr/local/bin/gpu_diag_logger.sh
+fi
+mkdir -p /var/log/gpu-diag
+
+cat > /etc/systemd/system/gpu-diag-boot.service << EOF
+[Unit]
+Description=GPU diagnostic snapshot at boot
+After=multi-user.target gpu-rescan.service vllm-docker.service
+Wants=gpu-rescan.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gpu_diag_logger.sh --boot
+RemainAfterExit=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/gpu-diag-timer.service << EOF
+[Unit]
+Description=GPU diagnostic snapshot (timer-driven)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gpu_diag_logger.sh
+EOF
+
+cat > /etc/systemd/system/gpu-diag-timer.timer << EOF
+[Unit]
+Description=Run GPU diagnostic snapshot every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=gpu-diag-timer.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
 systemctl enable vllm-docker.service
 systemctl enable vllm-serve.service
 systemctl enable gpu-thermal-watchdog.service
 systemctl enable vllm-watchdog.service
+systemctl enable gpu-diag-boot.service
+systemctl enable gpu-diag-timer.timer
 
 echo "    Done."
 
