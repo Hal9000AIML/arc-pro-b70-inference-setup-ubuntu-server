@@ -236,6 +236,31 @@ ldconfig
 cd /
 rm -rf "$WORK_DIR"
 
+# GuC firmware update for Battlemage
+# Observed on 4x B70: with linux-firmware shipping GuC 70.44.1, all four GPUs
+# experienced blitter-engine (bcs) hangs requiring GuC engine resets under
+# sustained vLLM load, which cascaded into vLLM EngineCore RPC timeouts on
+# sample_tokens and killed the API server. Recommended GuC 70.45.2 contains
+# stability fixes. We pull it directly from kernel.org linux-firmware.git so
+# the version is pinned regardless of distro package lag.
+echo "    Updating Intel Battlemage GuC firmware to recommended 70.45.2..."
+GUC_URL="https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/xe/bmg_guc_70.bin"
+mkdir -p /lib/firmware/xe
+if wget -q -O /lib/firmware/xe/bmg_guc_70.bin.new "$GUC_URL"; then
+    if [[ -s /lib/firmware/xe/bmg_guc_70.bin.new ]]; then
+        [[ -f /lib/firmware/xe/bmg_guc_70.bin ]] && \
+            cp /lib/firmware/xe/bmg_guc_70.bin /lib/firmware/xe/bmg_guc_70.bin.old
+        mv /lib/firmware/xe/bmg_guc_70.bin.new /lib/firmware/xe/bmg_guc_70.bin
+        update-initramfs -u 2>/dev/null || true
+        echo "    GuC firmware updated. Reboot required to load new firmware."
+    else
+        rm -f /lib/firmware/xe/bmg_guc_70.bin.new
+        echo "    WARNING: GuC firmware download was empty — keeping distro version"
+    fi
+else
+    echo "    WARNING: could not fetch GuC firmware — keeping distro version"
+fi
+
 # Add user to render and video groups
 usermod -aG render "${REAL_USER}" 2>/dev/null || true
 usermod -aG video "${REAL_USER}" 2>/dev/null || true
@@ -411,13 +436,21 @@ if ! docker ps --format '{{.Names}}' | grep -q '^vllm-b70\$'; then
     exit 1
 fi
 
-# Idempotency guard: if vllm is already running inside the container, do
-# nothing. Without this, vllm-serve.service and the watchdog can both call
-# this script and spawn duplicate vllm processes, which deadlock fighting
-# for XPU memory.
-if docker exec vllm-b70 pgrep -f 'vllm serve' >/dev/null 2>&1; then
-    echo "vLLM already running inside vllm-b70 — skipping start"
+# Idempotency guard: check if vllm is ALREADY HEALTHY (listening on port and
+# responding to /health), not just if the process exists. A crashed vllm
+# often leaves orphaned worker processes or a zombie bash wrapper that would
+# match 'pgrep -f "vllm serve"' — an earlier version of this guard did that
+# and refused to start a new vllm after a hang, leaving the bot stack dead.
+if curl -sf --max-time 3 "http://127.0.0.1:${VLLM_PORT}/health" >/dev/null 2>&1; then
+    echo "vLLM already healthy on port ${VLLM_PORT} — skipping start"
     exit 0
+fi
+# If we get here, vllm is not healthy. Clean up any orphaned processes +
+# shared-memory segments before spawning a fresh one.
+if docker exec vllm-b70 pgrep -f 'vllm serve' >/dev/null 2>&1; then
+    echo "vLLM process exists but port ${VLLM_PORT} is not responding — cleaning up orphans"
+    "${REAL_HOME}/stop_vllm.sh" || true
+    sleep 2
 fi
 
 docker exec -d vllm-b70 bash -c "
@@ -442,7 +475,7 @@ vllm serve /llm/models/${MODEL_LOCAL_NAME} \\
   --no-enable-prefix-caching \\
   --trust-remote-code \\
   --chat-template /llm/models/${MODEL_LOCAL_NAME}/chat_template.jinja \\
-  2>&1 | tee /tmp/vllm.log
+  2>&1 | tee -a /tmp/vllm.log
 "
 echo "vLLM starting (${VLLM_MODEL_NAME}, TP=\${GPU_COUNT})..."
 echo "Health check: curl http://localhost:${VLLM_PORT}/health"
@@ -633,36 +666,76 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-# --- vLLM watchdog script (auto-restart on crash) ---
+# --- vLLM watchdog script (auto-restart on crash or hang) ---
+# IMPORTANT: the authoritative liveness check is an HTTP probe of /health,
+# NOT 'pgrep vllm serve'. When vLLM hangs on a GPU blitter-engine reset, the
+# EngineCore dies but orphaned worker processes (and the bash wrapper) can
+# linger — pgrep would incorrectly report vllm as alive and the watchdog
+# would never restart it. Observed failure: engine_class=bcs GuC reset ->
+# RPC call to sample_tokens timed out -> EngineCore dead -> port 8000 dead.
 cat > "${REAL_HOME}/watchdog_vllm.sh" << WATCHEOF
 #!/usr/bin/env bash
-# vLLM Watchdog — restarts vLLM if container or process crashes
 LOG=${REAL_HOME}/watchdog.log
-echo "\$(date): Watchdog started" >> \$LOG
+HEALTH_URL="http://127.0.0.1:${VLLM_PORT}/health"
+CONSECUTIVE_FAILURES=0
+FAILURE_THRESHOLD=2     # 2 consecutive failures (60s) between checks
+STUCK_THRESHOLD=300     # up to 10 min for model load after a restart
+STARTUP_GRACE=600       # up to 20 min for first-boot model load (cold cache)
+
+echo "\$(date): Watchdog started (health-check mode)" >> \$LOG
+
+# Startup grace period: wait for initial health before enforcing the
+# failure threshold. Prevents the watchdog from killing in-progress model
+# loads on boot or after an operator-initiated restart. Model load on cold
+# cache + swap-backed systems can take 10+ minutes.
+echo "\$(date): Entering startup grace (up to \$STARTUP_GRACE seconds)" >> \$LOG
+for i in \$(seq 1 \$STARTUP_GRACE); do
+    if curl -sf --max-time 3 "\$HEALTH_URL" >/dev/null 2>&1; then
+        echo "\$(date): Initial health OK after \${i}s" >> \$LOG
+        break
+    fi
+    sleep 1
+done
+
+restart_vllm() {
+    echo "\$(date): Triggering vLLM restart" >> \$LOG
+    "${REAL_HOME}/stop_vllm.sh" 2>>\$LOG || true
+    sleep 3
+    "${REAL_HOME}/start_vllm.sh" >>\$LOG 2>&1 || true
+    # Wait for /health to come back (up to \$STUCK_THRESHOLD * 2 seconds)
+    for i in \$(seq 1 \$STUCK_THRESHOLD); do
+        if curl -sf --max-time 3 "\$HEALTH_URL" >/dev/null 2>&1; then
+            echo "\$(date): vLLM healthy after \$((i*2))s" >> \$LOG
+            CONSECUTIVE_FAILURES=0
+            return 0
+        fi
+        sleep 2
+    done
+    echo "\$(date): vLLM did not become healthy after restart" >> \$LOG
+    return 1
+}
 
 while true; do
-    # Check if container is running
+    # Container liveness
     if ! docker ps --format '{{.Names}}' | grep -q '^vllm-b70\$'; then
-        echo "\$(date): Container down, restarting..." >> \$LOG
-        sudo docker start vllm-b70 2>/dev/null || true
-        sleep 5
+        echo "\$(date): Container down, restarting docker service..." >> \$LOG
+        sudo systemctl restart vllm-docker 2>>\$LOG || true
+        sleep 15
+        restart_vllm
+        sleep 30
+        continue
     fi
 
-    # Check if vLLM process is running inside container
-    VLLM_PID=\$(docker exec vllm-b70 pgrep -f 'vllm serve' 2>/dev/null)
-    if [ -z "\$VLLM_PID" ]; then
-        echo "\$(date): vLLM not running, starting..." >> \$LOG
-        ${REAL_HOME}/start_vllm.sh
-        # Wait for model to load (up to 10 min for swap-heavy systems)
-        for i in \$(seq 1 300); do
-            if curl -sf http://127.0.0.1:${VLLM_PORT}/health >/dev/null 2>&1; then
-                echo "\$(date): vLLM healthy after \$((i*2))s" >> \$LOG
-                break
-            fi
-            sleep 2
-        done
+    # HTTP health probe — the authoritative check
+    if curl -sf --max-time 3 "\$HEALTH_URL" >/dev/null 2>&1; then
+        CONSECUTIVE_FAILURES=0
+    else
+        CONSECUTIVE_FAILURES=\$((CONSECUTIVE_FAILURES + 1))
+        echo "\$(date): Health check failed (\$CONSECUTIVE_FAILURES/\$FAILURE_THRESHOLD)" >> \$LOG
+        if [ \$CONSECUTIVE_FAILURES -ge \$FAILURE_THRESHOLD ]; then
+            restart_vllm
+        fi
     fi
-
     sleep 30
 done
 WATCHEOF
