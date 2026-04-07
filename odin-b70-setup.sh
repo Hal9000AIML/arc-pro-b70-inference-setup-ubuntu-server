@@ -487,6 +487,8 @@ vllm serve /llm/models/${MODEL_LOCAL_NAME} \\
   --block-size 64 \\
   --max-model-len 32768 \\
   --max-num-seqs 8 \\
+  --enable-auto-tool-choice \\
+  --tool-call-parser gemma4 \\
   --enable-chunked-prefill \\
   --no-enable-prefix-caching \\
   --trust-remote-code \\
