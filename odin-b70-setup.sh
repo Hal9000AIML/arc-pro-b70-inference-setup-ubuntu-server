@@ -793,6 +793,27 @@ else
     chmod 755 /usr/local/bin/vllm_vram_cleanup.sh
 fi
 
+# --- xe driver tuning (runs before vllm-docker at every boot) ---
+# Raises per-engine job_timeout_ms / preempt_timeout_us to the engine max and
+# pins GT frequency to disable DVFS. Root cause fix for the xe GuC watchdog
+# hang (xe_guc_submit.c:1291 guc_exec_queue_timedout_job) seen on Gemma 4
+# 26B-A4B FP8 TP=4 enforce_eager workloads where a single compute submission
+# can exceed the 5000 ms default timeout.
+XE_TUNING_SRC="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)/xe_tuning.sh"
+if [[ -f "\$XE_TUNING_SRC" ]]; then
+    install -m755 "\$XE_TUNING_SRC" /usr/local/bin/xe_tuning.sh
+fi
+XE_TMPFILES_SRC="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)/tmpfiles.d/xe-gpu-tuning.conf"
+if [[ -f "\$XE_TMPFILES_SRC" ]]; then
+    install -m644 "\$XE_TMPFILES_SRC" /etc/tmpfiles.d/xe-gpu-tuning.conf
+fi
+XE_UNIT_SRC="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)/systemd/xe-tuning.service"
+if [[ -f "\$XE_UNIT_SRC" ]]; then
+    install -m644 "\$XE_UNIT_SRC" /etc/systemd/system/xe-tuning.service
+    systemctl daemon-reload
+    systemctl enable xe-tuning.service
+fi
+
 # --- Systemd service for vLLM serve (with graceful stop) ---
 cat > /etc/systemd/system/vllm-serve.service << EOF
 [Unit]

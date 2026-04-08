@@ -1,0 +1,17 @@
+[Unit]
+Description=Intel xe GPU tuning for vLLM XPU workloads (Arc Pro B70)
+Documentation=https://github.com/brendanhouck/ProB70_Install
+After=systemd-modules-load.service
+Before=vllm-docker.service vllm-serve.service docker.service
+DefaultDependencies=no
+RequiresMountsFor=/sys
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/xe_tuning.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
