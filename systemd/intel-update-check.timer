@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Intel driver/firmware update check
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target
