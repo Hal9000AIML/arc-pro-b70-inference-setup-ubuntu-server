@@ -1,0 +1,18 @@
+[Unit]
+Description=ODIN inference box diagnostic sampler (one-shot, invoked by timer)
+Documentation=file:/opt/inference_diag/INFERENCE_DIAGNOSTICS.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/inference_diag/inference_diag.sh
+# Keep us runnable no matter how ugly things get:
+OOMScoreAdjust=-500
+CPUWeight=10
+IOWeight=10
+Nice=-5
+# Don't let a stuck probe pile up — give it hard wall-clock bounds.
+TimeoutStartSec=45
+# Still log to journal in addition to the JSONL file.
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,18 @@
+[Unit]
+Description=Capture previous-boot errors + tail for post-mortem after hard reset
+Documentation=file:/opt/inference_diag/INFERENCE_DIAGNOSTICS.md
+After=systemd-journald.service
+Wants=systemd-journald.service
+# Run once early in boot so we capture what happened BEFORE we reset.
+DefaultDependencies=no
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/inference_diag/capture_last_boot.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
