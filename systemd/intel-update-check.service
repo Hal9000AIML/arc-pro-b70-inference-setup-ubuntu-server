@@ -1,0 +1,11 @@
+[Unit]
+Description=Intel driver/firmware update check (Arc Pro B70)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/intel_update_check.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

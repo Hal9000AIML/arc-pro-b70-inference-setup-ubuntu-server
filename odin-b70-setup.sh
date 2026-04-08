@@ -911,6 +911,17 @@ systemctl enable vllm-watchdog.service
 systemctl enable gpu-diag-boot.service
 systemctl enable gpu-diag-timer.timer
 
+# Intel driver/firmware daily update checker
+SETUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SETUP_DIR/intel_update_check.sh" ]]; then
+    install -m 0755 "$SETUP_DIR/intel_update_check.sh" /usr/local/bin/intel_update_check.sh
+    install -m 0644 "$SETUP_DIR/systemd/intel-update-check.service" /etc/systemd/system/intel-update-check.service
+    install -m 0644 "$SETUP_DIR/systemd/intel-update-check.timer" /etc/systemd/system/intel-update-check.timer
+    systemctl daemon-reload
+    systemctl enable --now intel-update-check.timer
+    echo "    Intel update checker installed + enabled."
+fi
+
 echo "    Done."
 
 # -----------------------------------------------------------
