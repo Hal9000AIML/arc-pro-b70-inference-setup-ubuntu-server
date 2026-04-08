@@ -781,6 +781,18 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
+# --- VRAM cleanup helper (pre-start hook) ---
+# Reclaims VRAM held by crashed vLLM workers before re-launching the model.
+# Prevents level_zero UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY on dirty restarts.
+CLEANUP_SCRIPT_PATH="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)/vllm_vram_cleanup.sh"
+if [[ -f "\$CLEANUP_SCRIPT_PATH" ]]; then
+    install -m755 "\$CLEANUP_SCRIPT_PATH" /usr/local/bin/vllm_vram_cleanup.sh
+else
+    curl -fsSL https://raw.githubusercontent.com/Hal9000AIML/arc-pro-b70-inference-setup-ubuntu-server/master/vllm_vram_cleanup.sh \
+        -o /usr/local/bin/vllm_vram_cleanup.sh
+    chmod 755 /usr/local/bin/vllm_vram_cleanup.sh
+fi
+
 # --- Systemd service for vLLM serve (with graceful stop) ---
 cat > /etc/systemd/system/vllm-serve.service << EOF
 [Unit]
@@ -792,6 +804,10 @@ Requires=vllm-docker.service
 Type=oneshot
 RemainAfterExit=yes
 TimeoutStopSec=60
+# Reclaim VRAM from any crashed workers before (re)starting vLLM.
+# Defense-in-depth against level_zero UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY
+# on dirty restarts after xe GuC job timeouts.
+ExecStartPre=/usr/local/bin/vllm_vram_cleanup.sh
 ExecStartPre=/bin/sleep 10
 ExecStart=${REAL_HOME}/start_vllm.sh
 ExecStop=${REAL_HOME}/stop_vllm.sh
