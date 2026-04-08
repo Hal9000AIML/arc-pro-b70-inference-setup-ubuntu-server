@@ -1,0 +1,28 @@
+[Unit]
+Description=ODIN inference box LAN diagnostic HTTP endpoint (port 8765)
+Documentation=file:/opt/inference_diag/INFERENCE_DIAGNOSTICS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/inference_diag/diag_http.py
+Restart=always
+RestartSec=2
+# Survive memory/CPU pressure — this is the "last resort" health window:
+OOMScoreAdjust=-500
+CPUWeight=10
+IOWeight=10
+Nice=-5
+MemoryMin=16M
+# No privileges required; the log files are world-readable by design.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=
+PrivateTmp=false
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

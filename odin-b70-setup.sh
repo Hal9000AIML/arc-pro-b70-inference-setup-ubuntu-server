@@ -877,6 +877,22 @@ systemctl enable gpu-diag-timer.timer
 echo "    Done."
 
 # -----------------------------------------------------------
+# 9b. Inference diagnostic logger + LAN health HTTP endpoint
+# -----------------------------------------------------------
+# This installs a 60s JSONL sampler, a port-8765 HTTP endpoint that serves the
+# latest sample (so the main PC can check box health without SSH — crucial
+# when sshd wedges under swap pressure), and a boot-forensics capture service.
+# All units are OOM-protected with OOMScoreAdjust=-500.
+echo ""
+echo ">>> [9b] Installing inference diagnostic logger + LAN health endpoint"
+DIAG_INSTALLER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install_inference_diag.sh"
+if [[ -f "$DIAG_INSTALLER" ]]; then
+    bash "$DIAG_INSTALLER" || echo "    WARN: inference diag install reported a problem (continuing)"
+else
+    echo "    WARN: $DIAG_INSTALLER not found — skipping (re-run install_inference_diag.sh manually)"
+fi
+
+# -----------------------------------------------------------
 # 10. Firewall & monitoring tools
 # -----------------------------------------------------------
 echo ""
@@ -886,8 +902,9 @@ if command -v ufw &>/dev/null; then
     ufw allow 22/tcp comment "SSH" 2>/dev/null
     ufw allow "${VLLM_PORT}/tcp" comment "vLLM API" 2>/dev/null
     ufw allow "${LLAMACPP_PORT}/tcp" comment "llama.cpp" 2>/dev/null
+    ufw allow from 192.168.1.0/24 to any port 8765 proto tcp comment "inference diag HTTP" 2>/dev/null
     ufw --force enable 2>/dev/null
-    echo "    Firewall: ports 22, ${VLLM_PORT}, ${LLAMACPP_PORT} open"
+    echo "    Firewall: ports 22, ${VLLM_PORT}, ${LLAMACPP_PORT}, 8765 (LAN) open"
 fi
 
 # Install xpu-smi

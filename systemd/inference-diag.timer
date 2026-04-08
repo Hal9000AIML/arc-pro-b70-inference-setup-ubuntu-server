@@ -1,0 +1,13 @@
+[Unit]
+Description=Run ODIN inference diagnostic sampler every 60 seconds
+Documentation=file:/opt/inference_diag/INFERENCE_DIAGNOSTICS.md
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=inference-diag.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
