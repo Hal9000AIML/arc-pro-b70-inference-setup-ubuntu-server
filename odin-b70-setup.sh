@@ -28,7 +28,7 @@
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 LOG="/var/log/odin-b70-setup.log"
 
 # --- Configuration (edit these) ---
@@ -37,9 +37,14 @@ VLLM_MODEL_NAME="gemma-4-26B-A4B"                   # Served model name
 VLLM_PORT=8000                                  # vLLM API port
 LLAMACPP_PORT=8080                              # llama.cpp fallback port
 KERNEL_VERSION="6.17.0-20-generic"              # Minimum kernel for B70
-COMPUTE_RUNTIME_VERSION="26.09.37435.1"         # GitHub release tag
-IGC_VERSION="v2.30.1"                           # Intel Graphics Compiler
-VLLM_DOCKER_IMAGE="vllm-xpu:local"             # Built from source for Gemma 4 support
+# IMPORTANT: compute-runtime 26.09 + IGC 2.30.1 introduced a JIT null-deref on
+# Battlemage during model.forward (libigc.so.2.30.1 at offset ~0x23c0dfc).
+# We stay on 25.48.36300.8 + IGC 2.24.8, paired with UR_L0_USE_IMMEDIATE_COMMANDLISTS=0
+# which routes around the 25.48 libze GPF vtable bug (vllm-docker.service env).
+# Do NOT upgrade to 26.09 until Intel ships IGC 2.30.2+ with the JIT fix.
+COMPUTE_RUNTIME_VERSION="25.48.36300.8"         # Stable for BMG + vLLM (do not upgrade)
+IGC_VERSION="v2.24.8"                           # Paired with 25.48 (do not upgrade)
+VLLM_DOCKER_IMAGE="vllm-xpu:gemma4-fixed"      # See post-install hook for patches baked in
 # ----------------------------------
 
 touch "$LOG" && chmod 600 "$LOG"
@@ -470,11 +475,50 @@ if docker exec vllm-b70 pgrep -f 'vllm serve' >/dev/null 2>&1; then
 fi
 
 docker exec -d vllm-b70 bash -c "
+# vLLM XPU env vars (DO NOT REMOVE — each works around a specific BMG/vLLM bug)
+#
+# ZE_AFFINITY_MASK=1,3      — Cards 0/2 have shown silent SEGV on this rig;
+#                             cards 1,3 are the verified-stable pair for TP=2.
+# UR_L0_USE_IMMEDIATE_COMMANDLISTS=0
+#                           — Routes around libze 25.48 vtable GPF in the
+#                             kernel residency path (dmesg traps: GPF in
+#                             libze_intel_gpu.so.1.14.36300[6e36f5]).
+# CCL_TOPO_P2P_ACCESS=0     — Forces XCCL allreduce through system RAM instead
+#                             of Level Zero P2P (P2P init hangs TP=2 workers).
+# VLLM_WORKER_MULTIPROC_METHOD=spawn
+#                           — Required for multi-GPU XPU; fork deadlocks on xccl.
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+#                           — Allows max-model-len > model's native context.
+export ZE_AFFINITY_MASK=1,3
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export UR_L0_USE_IMMEDIATE_COMMANDLISTS=0
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export CCL_TOPO_P2P_ACCESS=0
 
+# vLLM CLI flags (DO NOT REMOVE — each works around a specific bug)
+#
+# --enforce-eager           — XPU Graph is not supported, eager is required.
+# --attention-backend TRITON_ATTN
+#                           — Triton is the only stable XPU attention backend for Gemma 4.
+# --disable-custom-all-reduce
+#                           — vLLM's custom AR kernel crashes on BMG.
+# --tensor-parallel-size 2  — TP=4 triggers libigc JIT crash on the 4-way init path;
+#                             TP=2 with ZE_AFFINITY_MASK=1,3 is the verified stable config.
+#                             Friday 3-model rollout will run: Gemma TP=2 (this),
+#                             Qwen3-Coder-30B TP=1 on card 0, Qwen3-8B+Embed TP=1 on card 2.
+# --skip-mm-profiling --language-model-only
+#                           — Gemma 4 is multimodal, but the MM dummy-batch profile_run
+#                             OOMs during worker init; we only need text inference.
+# --num-gpu-blocks-override 400
+#                           — Caps KV cache to avoid XPU allocator fragmentation on
+#                             per-layer-group KV tensors (workers OOM trying to
+#                             allocate 1.9-2.8 GiB contiguous after weights loaded).
+#                             Each block = 64 tokens; 400 blocks = 25,600 tokens KV cache.
+#                             Max concurrency for 32k prompts is ~1-2, which is fine
+#                             for the trading bots (max-num-seqs 4).
+# --gpu-memory-util 0.85    — Leaves headroom for Triton JIT compile space.
+# --max-num-seqs 4 --max-model-len 32768
+#                           — Matches the trading bot expected load.
 vllm serve /llm/models/${MODEL_LOCAL_NAME} \\
   --served-model-name ${VLLM_MODEL_NAME} \\
   --port ${VLLM_PORT} \\
@@ -482,12 +526,16 @@ vllm serve /llm/models/${MODEL_LOCAL_NAME} \\
   --dtype bfloat16 \\
   --quantization fp8 \\
   --enforce-eager \\
+  --skip-mm-profiling \\
+  --language-model-only \\
+  --attention-backend TRITON_ATTN \\
   --disable-custom-all-reduce \\
-  --tensor-parallel-size ${GPU_COUNT} \\
-  --gpu-memory-util 0.65 \\
+  --tensor-parallel-size 2 \\
+  --gpu-memory-util 0.85 \\
   --block-size 64 \\
   --max-model-len 32768 \\
-  --max-num-seqs 8 \\
+  --max-num-seqs 4 \\
+  --num-gpu-blocks-override 400 \\
   --enable-auto-tool-choice \\
   --tool-call-parser gemma4 \\
   --enable-chunked-prefill \\
@@ -496,7 +544,7 @@ vllm serve /llm/models/${MODEL_LOCAL_NAME} \\
   --chat-template /llm/models/${MODEL_LOCAL_NAME}/chat_template.jinja \\
   2>&1 | tee -a /tmp/vllm.log
 "
-echo "vLLM starting (${VLLM_MODEL_NAME}, TP=\${GPU_COUNT})..."
+echo "vLLM starting (${VLLM_MODEL_NAME}, TP=2 on cards 1,3)..."
 echo "Health check: curl http://localhost:${VLLM_PORT}/health"
 VLLMSCRIPT
 
@@ -910,6 +958,98 @@ systemctl enable gpu-thermal-watchdog.service
 systemctl enable vllm-watchdog.service
 systemctl enable gpu-diag-boot.service
 systemctl enable gpu-diag-timer.timer
+
+# -----------------------------------------------------------
+# 8b. BMG/vLLM post-install patches (bake into container image)
+# -----------------------------------------------------------
+# These work around three Intel stack bugs that block Gemma 4 on BMG:
+#
+# 1. libze 25.48 Tokenizer pickle roundtrip bug
+#    Rust tokenizers 0.22.2 can't unpickle its own Tokenizer state when merges
+#    use the new list format (Gemma 4 tokenizer.json does). Hits copy.deepcopy(kwargs)
+#    inside transformers.processing_utils.get_processor_dict and
+#    transformers.configuration_utils.get_config_dict. Fix: monkey-patch
+#    Tokenizer.__deepcopy__ to return self (Tokenizer is immutable in our use).
+#    Installed as a .pth hook so it runs at every Python interpreter start,
+#    including multiprocessing spawn subprocesses.
+#
+# 2. Gemma 4 tokenizer.json new-format merges crash IGC during BPE init
+#    Even with the deepcopy fix, some code paths try to re-parse the minimal
+#    tokenizer.json through TokenizerFast.from_str() and hit "Token ,[ out of
+#    vocabulary at line 2322064 column 1". Fix: convert merges from
+#    [[a, b], ...] list format to legacy "a b" space-joined strings.
+#    Safe because NO Gemma 4 merge token contains a space (verified).
+#    One-time model-side patch. Backup saved to tokenizer.json.bak.listmerges.
+#
+# 3. Host bind-mount cleanup
+#    Earlier systemd-unit experiments left libze/libigdgmm host paths bind-
+#    mounted read-only into the container, which breaks dpkg and makes
+#    /usr/lib/x86_64-linux-gnu unwritable. Unit already cleaned, but the
+#    post-install verifies no stale bind mounts remain.
+
+if docker ps --format '{{.Names}}' | grep -q '^vllm-b70$'; then
+    echo "[+] Baking BMG/vLLM patches into container..."
+
+    # 1) Tokenizer deepcopy patch via .pth hook (fires on every Python start)
+    cat > /tmp/_tok_fix.py << 'TOKFIX'
+try:
+    import tokenizers
+    _T = tokenizers.Tokenizer
+    if not getattr(_T, '_dc_patched', False):
+        _T.__deepcopy__ = lambda self, memo=None: self
+        _T._dc_patched = True
+except Exception as _e:
+    import sys; sys.stderr.write('[_tok_fix] ' + str(_e) + chr(10))
+TOKFIX
+    cat > /tmp/z_tokenizer_fix.pth << 'PTH'
+import sys; exec(open('/opt/venv/lib/python3.12/site-packages/_tok_fix.py').read()) if __import__('os').path.exists('/opt/venv/lib/python3.12/site-packages/_tok_fix.py') else None
+PTH
+    docker cp /tmp/_tok_fix.py vllm-b70:/opt/venv/lib/python3.12/site-packages/_tok_fix.py
+    docker cp /tmp/z_tokenizer_fix.pth vllm-b70:/opt/venv/lib/python3.12/site-packages/z_tokenizer_fix.pth
+    docker exec vllm-b70 python3 -c "import tokenizers; assert getattr(tokenizers.Tokenizer, '_dc_patched', False), 'patch not applied'; print('[+] tokenizer deepcopy patch: OK')"
+
+    # 2) Gemma 4 tokenizer.json legacy merges conversion (model-side, persistent)
+    GEMMA_TOK="${MODEL_DIR}/gemma-4-26B-A4B-it/tokenizer.json"
+    if [[ -f "$GEMMA_TOK" ]]; then
+        if [[ ! -f "${GEMMA_TOK}.bak.listmerges" ]]; then
+            cp "$GEMMA_TOK" "${GEMMA_TOK}.bak.listmerges"
+        fi
+        python3 - << PYTOK
+import json, sys
+p = "$GEMMA_TOK"
+d = json.load(open(p))
+m = d.get("model", {}).get("merges", [])
+if m and isinstance(m[0], list):
+    new = [(x[0] + " " + x[1]) if isinstance(x, list) and len(x) == 2 else x for x in m]
+    d["model"]["merges"] = new
+    json.dump(d, open(p, "w"), ensure_ascii=False)
+    print(f"[+] gemma-4 tokenizer.json: converted {len(m)} merges to legacy string format")
+else:
+    print("[+] gemma-4 tokenizer.json: already legacy format, skipping")
+PYTOK
+    else
+        echo "[!] Gemma 4 model not found at $GEMMA_TOK — skipping tokenizer merges conversion."
+        echo "    After downloading the model, re-run this section or run the helper:"
+        echo "    sudo $SETUP_DIR/fix_gemma4_tokenizer.sh"
+    fi
+
+    # 3) Verify no stale libze/libigdgmm host bind-mounts on the container
+    if docker inspect vllm-b70 --format '{{json .Mounts}}' | grep -qE 'libze_intel_gpu|libigdgmm'; then
+        echo "[!] WARNING: container has stale libze/libigdgmm bind-mounts from an"
+        echo "    earlier experiment. Stop/remove container and re-create via systemd"
+        echo "    to clean them up, otherwise dpkg in-container upgrades will fail with"
+        echo "    'unable to make backup link ... Invalid cross-device link'."
+    fi
+
+    # 4) Commit the patched container as a versioned image so the patches survive
+    #    systemd restart. Downstream vllm-docker.service already references
+    #    vllm-xpu:gemma4-fixed (see VLLM_DOCKER_IMAGE above).
+    docker commit vllm-b70 vllm-xpu:gemma4-fixed >/dev/null
+    echo "[+] Committed patched container as vllm-xpu:gemma4-fixed"
+else
+    echo "[!] vllm-b70 container is not running — skipping patch bake."
+    echo "    Start it with: sudo systemctl start vllm-docker && sudo $0"
+fi
 
 # Intel driver/firmware daily update checker
 SETUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

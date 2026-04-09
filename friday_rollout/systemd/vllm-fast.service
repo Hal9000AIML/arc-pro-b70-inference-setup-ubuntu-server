@@ -1,0 +1,19 @@
+[Unit]
+Description=vLLM Qwen3-8B (Tier 3 fast) on card 2 TP=1
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=600
+TimeoutStopSec=30
+ExecStartPre=-/usr/bin/docker stop vllm-b70-fast
+ExecStartPre=-/usr/bin/docker rm vllm-b70-fast
+ExecStart=/usr/bin/docker run -d --privileged --shm-size 16g --net=host --ipc=host --restart=unless-stopped --device /dev/dri:/dev/dri -v /mnt/models:/llm/models --name=vllm-b70-fast --entrypoint= vllm-xpu:gemma4-fixed sleep infinity
+ExecStartPost=/home/brendanhouck/start_fast.sh
+ExecStop=/usr/bin/docker stop -t 15 vllm-b70-fast
+
+[Install]
+WantedBy=multi-user.target

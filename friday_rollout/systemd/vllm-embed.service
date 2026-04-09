@@ -1,0 +1,19 @@
+[Unit]
+Description=vLLM Qwen3-Embedding-4B (embedder) on card 2 co-resident
+After=network-online.target docker.service vllm-fast.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=600
+TimeoutStopSec=30
+ExecStartPre=-/usr/bin/docker stop vllm-b70-embed
+ExecStartPre=-/usr/bin/docker rm vllm-b70-embed
+ExecStart=/usr/bin/docker run -d --privileged --shm-size 8g --net=host --ipc=host --restart=unless-stopped --device /dev/dri:/dev/dri -v /mnt/models:/llm/models --name=vllm-b70-embed --entrypoint= vllm-xpu:gemma4-fixed sleep infinity
+ExecStartPost=/home/brendanhouck/start_embed.sh
+ExecStop=/usr/bin/docker stop -t 15 vllm-b70-embed
+
+[Install]
+WantedBy=multi-user.target

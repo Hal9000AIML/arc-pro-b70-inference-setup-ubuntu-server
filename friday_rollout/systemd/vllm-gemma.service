@@ -1,0 +1,19 @@
+[Unit]
+Description=vLLM Gemma 4 26B-A4B (Tier 1 general) on cards 1,3 TP=2
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=600
+TimeoutStopSec=30
+ExecStartPre=-/usr/bin/docker stop vllm-b70-gemma
+ExecStartPre=-/usr/bin/docker rm vllm-b70-gemma
+ExecStart=/usr/bin/docker run -d --privileged --shm-size 32g --net=host --ipc=host --restart=unless-stopped --device /dev/dri:/dev/dri -v /mnt/models:/llm/models --name=vllm-b70-gemma --entrypoint= vllm-xpu:gemma4-fixed sleep infinity
+ExecStartPost=/home/brendanhouck/start_gemma.sh
+ExecStop=/usr/bin/docker stop -t 15 vllm-b70-gemma
+
+[Install]
+WantedBy=multi-user.target
