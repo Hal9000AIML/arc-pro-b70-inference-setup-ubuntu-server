@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# start_coder.sh — Tier 2 code LLM: Qwen3-Coder-30B-A3B-Instruct (FP8)
+# start_coder.sh — Tier 2 code LLM: Qwen2.5-Coder-14B-Instruct (FP8)
 # Card: 0 (TP=1)    Port: 8001    Container: vllm-b70-coder
 #
-# MoE with ~3B active params, fits comfortably on one B70 at FP8.
-# Uses a separate container so we can tune/restart independently of Gemma.
-#
-# NOTE: Card 0 has not been production-exercised yet (cards 1,3 were the
-# verified-stable pair on 2026-04-09). If card 0 SEGVs during init, fall
-# back to card 2 (free this card by pointing start_fast.sh at card 3 or
-# re-using Gemma's leftover capacity on cards 1,3).
+# Dense 14B model, ~14GB at FP8, fits on one B70 with room for KV cache.
+# Note: Qwen3-Coder-30B-A3B was tested but its 30GB FP8 weights leave no
+# room for KV cache on a 32GB card. GPTQ 4-bit also failed — vLLM XPU
+# doesn't have gptq_shuffle kernels compiled.
 # =============================================================================
 set -e
 CONT=vllm-b70-coder
-MODEL=/llm/models/Qwen3-Coder-30B-A3B-Instruct
+MODEL=/llm/models/Qwen2.5-Coder-14B-Instruct
 PORT=8001
 
 if ! docker ps --format '{{.Names}}' | grep -q "^${CONT}$"; then
@@ -33,7 +30,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export CCL_TOPO_P2P_ACCESS=0
 
 vllm serve ${MODEL} \\
-  --served-model-name qwen3-coder-30B \\
+  --served-model-name qwen25-coder-14B \\
   --port ${PORT} \\
   --host 0.0.0.0 \\
   --dtype bfloat16 \\
