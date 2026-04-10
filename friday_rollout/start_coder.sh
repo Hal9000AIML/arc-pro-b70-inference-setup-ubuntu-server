@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# start_coder.sh — Tier 2 code LLM: Qwen2.5-Coder-14B-Instruct (FP8)
-# Card: 0 (TP=1)    Port: 8001    Container: vllm-b70-coder
+# start_coder.sh — Qwen2.5-Coder-14B via llama.cpp Vulkan (Q4_K_M)
+# Card: 0 (single GPU)   Port: 8001
 #
-# Dense 14B model, ~14GB at FP8, fits on one B70 with room for KV cache.
-# Note: Qwen3-Coder-30B-A3B was tested but its 30GB FP8 weights leave no
-# room for KV cache on a 32GB card. GPTQ 4-bit also failed — vLLM XPU
-# doesn't have gptq_shuffle kernels compiled.
+# Upgraded from 7B BF16 via vLLM to 14B Q4 via llama.cpp Vulkan.
+# Q4 on Intel Arc gives 5.5x speedup over Q8, making 14B feasible and fast.
 # =============================================================================
 set -e
-CONT=vllm-b70-coder
-MODEL=/llm/models/Qwen2.5-Coder-14B-Instruct
+
+MODEL=/home/brendanhouck/models/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf
 PORT=8001
 
-if ! docker ps --format '{{.Names}}' | grep -q "^${CONT}$"; then
-    echo "ERROR: Container ${CONT} is not running."
+if ! [ -f "$MODEL" ]; then
+    echo "ERROR: Model not found at $MODEL"
+    echo "Download with: python3 -c \"from huggingface_hub import hf_hub_download; hf_hub_download('bartowski/Qwen2.5-Coder-14B-Instruct-GGUF', 'Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf', local_dir='/home/brendanhouck/models')\""
     exit 1
 fi
 if curl -sf --max-time 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
@@ -22,30 +21,22 @@ if curl -sf --max-time 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
     exit 0
 fi
 
-docker exec -d "${CONT}" bash -c "
-export ZE_AFFINITY_MASK=0
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export UR_L0_USE_IMMEDIATE_COMMANDLISTS=0
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export CCL_TOPO_P2P_ACCESS=0
+export GGML_VK_DEVICE=0
+export LLAMA_ARG_DEVICE=Vulkan0
 
-vllm serve ${MODEL} \\
-  --served-model-name qwen25-coder-14B \\
-  --port ${PORT} \\
-  --host 0.0.0.0 \\
-  --dtype bfloat16 \\
-  --quantization fp8 \\
-  --enforce-eager \\
-  --attention-backend TRITON_ATTN \\
-  --disable-custom-all-reduce \\
-  --tensor-parallel-size 1 \\
-  --gpu-memory-util 0.85 \\
-  --block-size 64 \\
-  --max-model-len 32768 \\
-  --max-num-seqs 8 \\
-  --enable-chunked-prefill \\
-  --no-enable-prefix-caching \\
-  --trust-remote-code \\
-  2>&1 | tee -a /tmp/vllm_coder.log
-"
-echo "Qwen3-Coder-30B starting on port ${PORT} (TP=1, card 0)..."
+nohup /opt/llama.cpp/llama-b8739/llama-server \
+  -m "$MODEL" \
+  --host 0.0.0.0 \
+  --port ${PORT} \
+  --n-gpu-layers 99 \
+  --ctx-size 8192 \
+  --flash-attn on \
+  --parallel 1 \
+  --threads 4 \
+  --split-mode none \
+  --mlock \
+  --no-mmap \
+  -b 512 \
+  > /tmp/llama_coder.log 2>&1 &
+
+echo "Coder 14B Q4 starting on card 0 via llama.cpp Vulkan (PID: $!)..."
