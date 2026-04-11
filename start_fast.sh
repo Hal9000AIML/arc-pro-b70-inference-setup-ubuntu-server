@@ -10,4 +10,5 @@ exec /opt/llama.cpp/llama-b8739/llama-server \
     --host 0.0.0.0 --port 8002 \
     --alias Qwen3-8B \
     -t 2 \
+    --reasoning off \
     --log-file /tmp/llama-fast.log

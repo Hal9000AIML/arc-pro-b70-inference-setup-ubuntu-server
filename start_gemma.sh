@@ -12,4 +12,5 @@ exec /opt/llama.cpp/llama-b8739/llama-server \
     -t 2 \
     --chat-template-file /mnt/models/gemma-4-26B-A4B-it/chat_template.jinja \
     --jinja \
+    --reasoning off \
     --log-file /tmp/llama-gemma.log
