@@ -1,0 +1,17 @@
+[Unit]
+Description=llama.cpp Vulkan - Gemma 4 26B-A4B (port 8000)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=brendanhouck
+Restart=always
+RestartSec=30
+TimeoutStopSec=60
+ExecStart=/home/brendanhouck/start_gemma.sh
+StandardOutput=append:/tmp/llama-gemma.log
+StandardError=append:/tmp/llama-gemma.log
+
+[Install]
+WantedBy=multi-user.target
