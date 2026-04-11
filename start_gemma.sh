@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Gemma 4 26B-A4B — llama.cpp Vulkan3 (BDF 47:00.0, x16, Die 1), Q4_K_M, port 8000
-# --parallel 2: 32768/2 = 16384 tokens per slot (fits ODIN conversations)
-exec /opt/llama.cpp/llama-b8739/llama-server \
+# Gemma 4 26B-A4B — llama.cpp SYCL1 (BDF 10:00.0, x16, Die 0), Q4_K_M, port 8000
+source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
+export UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
+export GGML_SYCL_ENABLE_FLASH_ATTN=0
+export SYCL_CACHE_PERSISTENT=0
+export ZES_ENABLE_SYSMAN=1
+exec /opt/llama.cpp/llama-sycl-build/bin/llama-server \
     --model /mnt/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf \
-    --device Vulkan3 \
+    --device SYCL1 \
     -ngl 999 \
     -c 32768 \
     --parallel 2 \
@@ -14,4 +18,5 @@ exec /opt/llama.cpp/llama-b8739/llama-server \
     --chat-template-file /mnt/models/gemma-4-26B-A4B-it/chat_template.jinja \
     --jinja \
     --reasoning off \
+    --no-warmup \
     --log-file /tmp/llama-gemma.log
