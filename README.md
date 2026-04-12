@@ -3,7 +3,7 @@
 > **Ubuntu Server 24.04 LTS** install. For the Windows installer, see
 > [arc-pro-b70-inference-setup-windows](https://github.com/Hal9000AIML/arc-pro-b70-inference-setup-windows).
 
-Automated setup script for running LLM inference on Intel Arc Pro B70 GPUs with vLLM tensor parallelism.
+Automated setup script for running LLM inference on Intel Arc Pro B70 GPUs with llama.cpp SYCL — four independent model slots, one per card, each on its own port.
 
 ## Hardware
 
@@ -11,13 +11,20 @@ Automated setup script for running LLM inference on Intel Arc Pro B70 GPUs with 
 |-----------|------|
 | **Motherboard** | ASUS ROG Zenith Extreme X399 |
 | **CPU** | AMD Threadripper 1900X (8c/16t) |
-| **RAM** | 16GB DDR4-3200 (upgrading to 128GB 4x32GB DDR4-3200) |
+| **RAM** | 128GB DDR4-3200 (4x32GB, quad-channel, installed 2026-04-10) |
 | **GPUs** | 4x Intel Arc Pro B70 (128GB VRAM total, 32GB each) |
 | **Boot Drive** | 256GB NVMe |
-| **Model Storage** | 4TB SSD (arriving) |
+| **Model Storage** | 4TB SSD |
 | **PSU** | EVGA SuperNOVA 1600 G+ |
 | **Case** | Phanteks Enthoo Pro |
 | **OS** | Ubuntu Server 24.04 LTS, kernel 6.17+ |
+
+> **RAM speed note:** The Threadripper 1900X memory controller officially supports DDR4-2400, with the X399
+> platform (Zenith Extreme) pushing up to DDR4-2666 reliably at full population (4 DIMMs, one per channel).
+> DDR4-3200 XMP/DOCP profiles typically fail to train at 4×32GB on 1st-gen Threadripper. Run at stock
+> (2666 MHz) or DOCP 2933 MHz — do not force 3200, it will cause random reboots under memory pressure.
+> Quad-channel DDR4-2666 still delivers ~70–75 GB/s real-world bandwidth, which is the target for
+> eliminating swap bottlenecks.
 
 ### BIOS Settings (required)
 - Above 4G Decoding: **ENABLED**
@@ -27,46 +34,42 @@ Automated setup script for running LLM inference on Intel Arc Pro B70 GPUs with 
 - SR-IOV: **ENABLED**
 - PCIE_X8/X4_4: **X8 Mode**
 - Slow Mode switch on Zenith Extreme: **OFF** (causes PCIe link training failures)
+- Memory: **DOCP 2666** (or stock 2400) — do not enable 3200 XMP at full 4-DIMM population
 
-## Performance — Gemma 4 26B-A4B (MoE, 3.8B active params)
+## Model Layout
 
-### Benchmarked: 4x B70, TP=4, 16GB RAM + 64GB swap
+Four independent llama.cpp SYCL servers, one per B70 card, each pinned to its PCIe slot:
 
-| Concurrency | Aggregate tok/s | Per-request tok/s |
-|-------------|----------------|-------------------|
-| 1 | 5.7 | 5.7 |
-| 4 | 18.6 | ~5.5 |
-| 8 | 37.0 | ~5.2 |
+| Port | Model | Quant | Device | PCIe Slot | Die |
+|------|-------|-------|--------|-----------|-----|
+| 8000 | Gemma 4 26B-A4B | Q8_0 | SYCL1 (BDF 10:00.0) | x16 | Die 0 |
+| 8001 | Qwen3-14B | Q8_0 | SYCL3 (BDF 44:00.0) | x16 | Die 1 |
+| 8002 | Qwen3.5-9B | Q4_K_M | SYCL2 (BDF 43:00.0) | x8 | Die 1 |
+| 8003 | RedSage-Qwen3-8B | Q4_K_M | Vulkan (card 1) | x8 | Die 0 |
 
-**Prompt throughput**: 290-544 tok/s | **GPU temps under load**: 63-71°C pkg, 64-74°C VRAM
+Each server is fully independent — different models, contexts, and ports. No tensor parallelism, no shared state.
 
-> **Note:** These results are swap-bottlenecked. The 16GB system RAM forces vLLM's scheduler and weight loading through NVMe swap at ~3-5 GB/s instead of DDR4 at ~85 GB/s.
+## Performance
 
-### Projected: 4x B70, TP=4, 128GB DDR4-3200 (quad-channel)
+Benchmarks with 128GB RAM installed (no swap):
 
-| Concurrency | Estimated tok/s | Notes |
-|-------------|----------------|-------|
-| 1 | 25-35 | MoE with 3.8B active, 4 GPUs |
-| 4 | 90-120 | Linear scaling |
-| 8 | 160-220 | Approaching GPU compute bound |
-| 16 | 280-350 | MoE routing efficient |
-| 64 | 420-500 | Near peak throughput |
-| 128 | 480-540 | Level1Techs territory, `--max-num-seqs 128` |
+| Model | Port | Context | Parallel Slots | Est. tok/s |
+|-------|------|---------|---------------|-----------|
+| Gemma 4 26B-A4B Q8_0 | 8000 | 32768 | 2 | ~25-35 single |
+| Qwen3-14B Q8_0 | 8001 | 32768 | 2 | ~40-55 single |
+| Qwen3.5-9B Q4_K_M | 8002 | 32768 | 2 | ~60-80 single |
+| RedSage-Qwen3-8B Q4_K_M | 8003 | 8192 | 1 | ~50-70 single |
+
+> **Note:** These are estimates pending full benchmarks with 128GB RAM. Prior vLLM numbers (5.7 tok/s
+> single, 37 tok/s @ 8 concurrent) were swap-bottlenecked on 16GB RAM — not representative of current
+> hardware.
 
 ### Reference Benchmarks
 
 | Config | Model | Single | 8 Concurrent | Source |
 |--------|-------|--------|-------------|--------|
-| 2x B70, 16GB RAM | Qwen2.5-14B BF16, TP=2 | 19 tok/s | 140 tok/s | Measured |
+| 2x B70, 16GB RAM | Qwen2.5-14B BF16, TP=2 | 19 tok/s | 140 tok/s | Measured (vLLM, swap) |
 | 4x B70, 128GB RAM | Qwen3.5-27B BF16, TP=4 | ~30 tok/s | 540 tok/s | Level1Techs |
-| 4x B70, 16GB+swap | Gemma 4 26B-A4B BF16, TP=4 | 5.7 tok/s | 37 tok/s | Measured (swap-limited) |
-
-### Model Sizing for B70 Configurations
-
-| GPUs | Total VRAM | Max BF16 Model | Recommended |
-|------|-----------|----------------|-------------|
-| 2x B70 | 64GB | ~27B dense | Qwen2.5-14B-Instruct |
-| 4x B70 | 128GB | ~60B dense, ~120B MoE | Gemma 4 26B-A4B (50GB BF16, MoE) |
 
 ## Quick Start
 
@@ -99,7 +102,7 @@ sudo dd if=arc-pro-b70-autoinstall.iso of=/dev/sdX bs=4M status=progress oflag=s
 4. `prob70-firstboot.service` automatically runs `odin-b70-setup.sh`
 5. Watch progress: `sudo journalctl -fu prob70-firstboot`
 
-The first-boot service is idempotent — it touches `/var/lib/prob70/installed` on success and won't re-run on subsequent boots. Total time from USB boot to working vLLM endpoint: ~60-90 minutes (depending on internet speed for the Docker pull and vLLM build).
+The first-boot service is idempotent — it touches `/var/lib/prob70/installed` on success and won't re-run on subsequent boots. Total time from USB boot to working inference endpoints: ~30-60 minutes (llama.cpp SYCL build is faster than the old vLLM source build).
 
 ### Option B — Manual install on existing Ubuntu
 
@@ -108,17 +111,20 @@ The first-boot service is idempotent — it touches `/var/lib/prob70/installed` 
 wget https://raw.githubusercontent.com/Hal9000AIML/arc-pro-b70-inference-setup/main/odin-b70-setup.sh
 chmod +x odin-b70-setup.sh
 
-# Run (takes 30-60 minutes — builds vLLM from source)
+# Run (takes 20-40 minutes — builds llama.cpp with SYCL backend)
 sudo ./odin-b70-setup.sh
 
 # Reboot (required for new kernel)
 sudo reboot
 
-# Start inference server
-~/boot_vllm.sh
+# Start all four inference servers
+~/start_gemma.sh &
+~/start_coder.sh &
+~/start_fast.sh &
+~/start_redsage.sh &
 
-# Test from any machine on your network
-curl http://<SERVER_IP>:8000/v1/chat/completions \
+# Test
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"gemma-4-26B-A4B","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
 ```
@@ -128,95 +134,113 @@ curl http://<SERVER_IP>:8000/v1/chat/completions \
 1. **Kernel 6.17+** — Required for the `xe` driver to recognize Battlemage GPUs
 2. **Intel compute-runtime v26.09** — From GitHub, not the APT repo (which is too old for B70)
 3. **Intel Graphics Compiler v2.30.1** — Matching IGC version
-4. **Docker + buildx** — Container runtime and build tools for vLLM
-5. **vLLM XPU (built from source)** — Latest main branch with Gemma 4 architecture support
-6. **llama.cpp (Vulkan)** — Single-GPU fallback at ~45 tok/s
-7. **Gemma 4 26B-A4B** — Default model (MoE, 3.8B active params, 256K context)
-8. **Chat template** — Required by transformers 5.x for Gemma 4
-9. **xpu-smi** — GPU monitoring (power, frequency, VRAM usage)
-10. **Systemd services** — Auto-starts Docker container and thermal watchdog on boot
-11. **Swap file** — Auto-created for systems with <64GB RAM
+4. **Intel oneAPI Base Toolkit** — SYCL runtime, Level Zero, oneMKL
+5. **llama.cpp (SYCL backend, built from source)** — OpenCL-free SYCL path; each card runs as an independent server
+6. **llama.cpp (Vulkan backend)** — For RedSage on the x8 slot (port 8003); also useful for GGUF fallback
+7. **Gemma 4 26B-A4B Q8_0** — Default primary model; 32K context, 2 parallel slots
+8. **Qwen3-14B Q8_0** — Coding/reasoning model; `--reasoning off` for direct mode
+9. **Qwen3.5-9B Q4_K_M** — Fast general model; fits in 32GB with room to spare
+10. **RedSage-Qwen3-8B Q4_K_M** — Cybersecurity-specialized model (port 8003, Vulkan)
+11. **xpu-smi** — GPU monitoring (power, frequency, VRAM usage)
+12. **Systemd services** — Auto-starts all four servers on boot
+13. **Chat templates** — `.jinja` templates for models that require them (Gemma 4)
 
 ## Architecture
 
 ```
-                    ┌──────────────────────────────────────────┐
-                    │          Docker Container                │
-                    │     vllm-xpu:local (built from source)   │
-                    │                                          │
-                    │     vLLM Server (port 8000)              │
-                    │     OpenAI-compatible API                │
-                    │                                          │
-                    │     Tensor Parallel (TP=4)               │
-                    │   ┌────────┐  ┌────────┐               │
-                    │   │ B70 #1 │  │ B70 #2 │               │
-                    │   │ 32GB   │  │ 32GB   │               │
-                    │   ├────────┤  ├────────┤               │
-                    │   │ B70 #3 │  │ B70 #4 │               │
-                    │   │ 32GB   │  │ 32GB   │               │
-                    │   └────────┘  └────────┘               │
-                    │         128GB VRAM total                 │
-                    └──────────────────────────────────────────┘
-                              │
-                         Port 8000
-                              │
-                    ┌─────────────────┐
-                    │   Trading Bots  │
-                    │   ODIN Agents   │
-                    │   LAN Clients   │
-                    └─────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │                   Ubuntu 24.04 Host                      │
+  │                                                          │
+  │  Port 8000           Port 8001           Port 8002       │
+  │  llama-server        llama-server        llama-server    │
+  │  Gemma 4 26B         Qwen3-14B           Qwen3.5-9B      │
+  │  Q8_0                Q8_0                Q4_K_M          │
+  │  ┌──────────┐        ┌──────────┐        ┌──────────┐    │
+  │  │  B70 #1  │        │  B70 #3  │        │  B70 #2  │    │
+  │  │  SYCL1   │        │  SYCL3   │        │  SYCL2   │    │
+  │  │  32GB    │        │  32GB    │        │  32GB    │    │
+  │  │  x16     │        │  x16     │        │  x8      │    │
+  │  └──────────┘        └──────────┘        └──────────┘    │
+  │                                                          │
+  │  Port 8003                                               │
+  │  llama-server                                            │
+  │  RedSage-8B Q4_K_M                                       │
+  │  ┌──────────┐                                            │
+  │  │  B70 #4  │                                            │
+  │  │  Vulkan  │                                            │
+  │  │  32GB    │                                            │
+  │  │  x8      │                                            │
+  │  └──────────┘                                            │
+  └──────────────────────────────────────────────────────────┘
+                          │
+              Ports 8000–8003 (OpenAI-compatible)
+                          │
+         ┌────────────────────────────────┐
+         │  ODIN Agents / Trading Bots    │
+         │  LAN Clients (192.168.1.x)     │
+         └────────────────────────────────┘
 ```
+
+Each server exposes an OpenAI-compatible `/v1/chat/completions` endpoint. ODIN routes by model tier: primary (8000), coder (8001), fast (8002), security (8003).
 
 ## Key Technical Details
 
-### Why Build vLLM from Source?
+### Why llama.cpp SYCL Instead of vLLM?
 
-The pre-built `intel/vllm:0.17.0-xpu` image (March 26, 2026) predates Gemma 4's release (April 2, 2026). The `gemma4` architecture support was merged via PR #38826 on April 2. Building from the latest vLLM main branch includes this plus Intel's FusedMoE XPU kernels optimized for Arc Pro B-series.
+vLLM XPU requires `--enforce-eager` (no CUDA graphs on Intel XPU) and a `--privileged` Docker container for oneCCL inter-GPU communication. At 4x TP=4, vLLM was bottlenecked by the host-side scheduler and oneCCL USM traffic through system RAM — the reason the 16GB swap benchmark produced only 5.7 tok/s single.
 
-The transformers library must also be upgraded to 5.x inside the container, as the Gemma 4 architecture is too new for the 4.x series that vLLM pins.
+llama.cpp SYCL sidesteps all of this:
+- No Docker, no container overhead, runs directly on the host
+- No inter-GPU communication — each card is fully independent
+- No Python scheduler — C++ server with minimal overhead
+- Each `llama-server` process pins to one `--device SYCL{n}` via Level Zero
 
-### Why `--privileged` Container?
+The tradeoff is no tensor parallelism (can't spread one 60B+ model across cards). For the current model sizes (8B–26B), single-card fits fine in 32GB.
 
-The newer oneCCL (2021.15.7) requires access to Level Zero IPC device file descriptors for inter-GPU communication. Without `--privileged`, the `ze_fd_manager` fails with "could not open device directory" errors during TP initialization. The older `intel/vllm:0.17.0-xpu` image used a different oneCCL version that worked without `--privileged`.
+### Critical llama.cpp SYCL Flags
 
-### Critical vLLM Flags
-
-| Flag | Why |
-|------|-----|
-| `--enforce-eager` | **Required.** CUDA graphs crash on Intel XPU. |
-| `--disable-custom-all-reduce` | **Required.** Forces oneCCL for inter-GPU communication. |
-| `--block-size 64` | Tuned for Arc Pro XMX engines. |
-| `--enable-chunked-prefill` | Improves memory utilization and throughput. |
-| `--no-enable-prefix-caching` | Prefix caching can cause instability on XPU. |
-| `--chat-template` | **Required for Gemma 4.** Tokenizer lacks built-in chat template. |
-| `--gpu-memory-util 0.85` | Leaves headroom for KV cache growth under concurrency. |
+| Flag | Value | Why |
+|------|-------|-----|
+| `--device` | `SYCL0`–`SYCL3` | Pins server to one specific B70 card |
+| `-ngl 999` | — | Offload all layers to GPU (no CPU fallback) |
+| `-c` | `32768` | 32K context per slot |
+| `--parallel` | `2` | Two simultaneous requests per server |
+| `--batch-size` | `2048` | KV cache fill batch — tuned for B70 XMX engines |
+| `--ubatch-size` | `512` | Micro-batch for prompt processing |
+| `--defrag-thold` | `0.1` | KV cache defrag at 10% fragmentation |
+| `-t` | `1` | One CPU decode thread (GPU-bound; more threads waste) |
+| `--no-warmup` | — | Skip warmup inference on start (faster boot) |
+| `--reasoning off` | — | Qwen3 models: suppress `<think>` blocks for direct output |
+| `--jinja` | — | Required for models with `.jinja` chat templates |
 
 ### Critical Environment Variables
 
 | Variable | Value | Why |
 |----------|-------|-----|
-| `VLLM_WORKER_MULTIPROC_METHOD` | `spawn` | Required for multi-GPU on XPU. |
-| `UR_L0_USE_IMMEDIATE_COMMANDLISTS` | `0` | Prevents Level Zero command list issues. |
-| `CCL_TOPO_P2P_ACCESS` | `0` | USM mode — routes allreduce through system RAM. Faster than P2P on PCIe 3.0 without bifurcation. Set to `1` on PCIe 5.0 platforms with x8/x8 bifurcation. |
+| `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS` | `1` | Allows SYCL USM allocations up to device VRAM limit |
+| `GGML_SYCL_ENABLE_FLASH_ATTN` | `1` | Enable FlashAttention on B70 XMX engines (~20% throughput gain) |
+| `SYCL_CACHE_PERSISTENT` | `0` | Disable persistent JIT cache (avoids stale kernels after driver updates) |
+| `ZES_ENABLE_SYSMAN` | `1` | Required for xpu-smi / sysman power and temp monitoring |
 
 ### RAM and Performance
 
-| RAM | Swap Needed | `--max-num-seqs` | Expected Generation tok/s (8 concurrent) |
-|-----|------------|-------------------|------------------------------------------|
-| 16GB | 64GB | 8 | ~37 (swap-bottlenecked) |
-| 32GB | 32GB | 16-32 | ~80-120 |
-| 64GB | None | 64 | ~200-350 |
-| 128GB | None | 128 | ~400-540 |
+With 128GB installed, all scheduler, tokenization, and embedding traffic runs in DDR4 instead of NVMe swap. The prior 16GB baseline:
 
-The CPU-side scheduler, tokenization, and oneCCL USM inter-GPU traffic all flow through host RAM. With 16GB, these operations page through NVMe swap at 3-5 GB/s. DDR4-3200 quad-channel delivers ~85 GB/s — a 20x improvement.
+| RAM | Swap Needed | `--parallel` | Observed tok/s (Gemma single) |
+|-----|------------|--------------|-------------------------------|
+| 16GB | 64GB NVMe | 1 | 5.7 (swap-bottlenecked, vLLM TP=4) |
+| 128GB | None | 2 per server | ~25-35 (estimated, llama.cpp SYCL) |
+
+> **RAM speed caveat:** See hardware note above — with 4x32GB on Threadripper 1900X, run DOCP 2666
+> (not 3200). Quad-channel DDR4-2666 gives ~70–75 GB/s real-world, vs. ~3–5 GB/s through NVMe swap.
 
 ### GPU Thermal Monitoring
 
-The script installs a systemd thermal watchdog (`gpu-thermal-watchdog.service`) that monitors all B70 GPUs every 30 seconds. If any GPU package or VRAM temperature reaches 90°C, it automatically stops vLLM for thermal protection.
+The script installs a systemd thermal watchdog (`gpu-thermal-watchdog.service`) that monitors all B70 GPUs every 30 seconds. If any GPU package or VRAM temperature reaches 90°C, it automatically stops inference servers for thermal protection.
 
 Observed temperatures under sustained load:
 - Idle: 52-58°C package, 56-62°C VRAM
-- Under load (8 concurrent): 63-71°C package, 64-74°C VRAM
+- Under load (2 parallel slots): 63-71°C package, 64-74°C VRAM
 - Throttle point: ~95°C
 - Thermal shutdown: ~110°C
 
@@ -231,21 +255,6 @@ sudo systemctl status gpu-thermal-watchdog
 cat /var/log/gpu_thermal.log
 ```
 
-## Fallback: llama.cpp Vulkan (Single GPU)
-
-For single-GPU inference with GGUF models, llama.cpp Vulkan delivers ~45-100 tok/s depending on model size:
-
-```bash
-# Download a GGUF model
-wget https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-Q4_K_M.gguf \
-  -O ~/models/gemma4-26b-q4.gguf
-
-# Start
-~/start_llamacpp.sh ~/models/gemma4-26b-q4.gguf
-```
-
-Note: llama.cpp's Vulkan multi-GPU (layer split) is broken — sequential pipeline with ~4x slowdown (bug #16767). Use vLLM for multi-GPU.
-
 ## Troubleshooting
 
 | Problem | Solution |
@@ -253,23 +262,24 @@ Note: llama.cpp's Vulkan multi-GPU (layer split) is broken — sequential pipeli
 | GPUs not detected in `lspci` | Enable Above 4G Decoding + ReBAR in BIOS, disable CSM |
 | `xe` driver not loading | Need kernel 6.17+. Check with `lsmod \| grep xe` |
 | `FATAL: Unknown device: deviceId: e223` | Compute-runtime too old. Install v26.09+ from GitHub |
-| vLLM `gemma4` architecture not recognized | Upgrade transformers: `pip install 'transformers>=4.59'` |
-| vLLM `Cannot allocate memory` during model load | Need more RAM or swap. Script auto-creates swap for <64GB systems |
-| vLLM oneCCL `opendir failed` / `device_fd invalid` | Use `--privileged` container flag |
-| vLLM TP=2 crashes with OOM | Lower `--gpu-memory-util` to 0.5, reduce `--max-num-seqs` |
+| llama.cpp SYCL `SYCL device not found` | Source oneAPI setvars: `source /opt/intel/oneapi/setvars.sh` |
+| llama.cpp can't allocate VRAM | Check `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1` is set |
+| Two servers try to use the same card | Verify `--device SYCL{n}` is unique per start script |
+| Memory won't train at DDR4-3200 | Expected on TR 1900X at 4 DIMMs — use DOCP 2666 or stock 2400 |
 | Thermal watchdog false trigger | Ensure watchdog filters MJ/W sensor lines (fixed in v1.2.1) |
 | WiFi broken after adding GPUs | Interface name changed. Check `ip link show` and update netplan |
 | WiFi broken with `iommu=off` | Use `iommu=pt` instead — keeps DMA working for 32-bit WiFi cards |
 | Slow Mode switch causes POST code 99 | Turn OFF the Slow Mode switch on Zenith Extreme |
 | BIOS bricked after EFI variable write | Use BIOS Flashback to recover — CMOS clear does NOT reset EFI NVRAM |
+| Gemma chat output garbled | Pass `--chat-template-file` + `--jinja`; Gemma 4 requires its `.jinja` template |
 
 ## Credits
 
-- [Level1Techs](https://forum.level1techs.com/t/intel-b70-launch-unboxed-and-tested/247873) — 4x B70 benchmark (540 tok/s)
+- [Level1Techs](https://forum.level1techs.com/t/intel-b70-launch-unboxed-and-tested/247873) — 4x B70 benchmark (540 tok/s, vLLM TP=4)
 - [vLLM Intel Arc Pro B-Series Blog](https://vllm.ai/blog/intel-arc-pro-b) — Intel's vLLM optimization work
 - [Run Gemma 4 on Intel Arc GPUs](https://huggingface.co/blog/MatrixYao/intel-gpu) — Intel's Day 0 Gemma 4 XPU guide
-- [intel/vllm](https://hub.docker.com/r/intel/vllm) — Docker images
 - [intel/compute-runtime](https://github.com/intel/compute-runtime) — GPU drivers
+- [ggerganov/llama.cpp](https://github.com/ggerganov/llama.cpp) — SYCL backend
 
 ## License
 
