@@ -17,5 +17,6 @@ exec /opt/llama.cpp/llama-sycl-build/bin/llama-server \
     --host 0.0.0.0 --port 8001 \
     --alias Qwen3-14B \
     -t 1 \
+    --reasoning off \
     --no-warmup \
     --log-file /tmp/llama-coder.log
