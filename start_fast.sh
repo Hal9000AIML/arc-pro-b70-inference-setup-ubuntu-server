@@ -6,7 +6,7 @@ export GGML_SYCL_ENABLE_FLASH_ATTN=1
 export SYCL_CACHE_PERSISTENT=0
 export ZES_ENABLE_SYSMAN=1
 exec /opt/llama.cpp/llama-sycl-build/bin/llama-server \
-    --model /mnt/models/Qwen3-8B-Q4_K_M.gguf \
+    --model /mnt/models/Qwen3-8B-Q8_0.gguf \
     --device SYCL2 \
     -ngl 999 \
     -c 32768 \
