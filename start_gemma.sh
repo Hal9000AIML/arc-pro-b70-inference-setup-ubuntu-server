@@ -11,10 +11,12 @@ exec /opt/llama.cpp/llama-sycl-build/bin/llama-server \
     -ngl 999 \
     -c 32768 \
     --parallel 2 \
-    --batch-size 512 \
+    --batch-size 2048 \
+    --ubatch-size 512 \
+    --defrag-thold 0.1 \
     --host 0.0.0.0 --port 8000 \
     --alias gemma-4-26B-A4B \
-    -t 2 \
+    -t 1 \
     --chat-template-file /mnt/models/gemma-4-26B-A4B-it/chat_template.jinja \
     --jinja \
     --reasoning off \
