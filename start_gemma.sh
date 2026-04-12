@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Gemma 4 26B-A4B — llama.cpp SYCL1 (BDF 10:00.0, x16, Die 0), Q4_K_M, port 8000
+# Gemma 4 26B-A4B — llama.cpp SYCL1 (BDF 10:00.0, x16, Die 0), Q8_0, port 8000
 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 export UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
 export GGML_SYCL_ENABLE_FLASH_ATTN=0
 export SYCL_CACHE_PERSISTENT=0
 export ZES_ENABLE_SYSMAN=1
 exec /opt/llama.cpp/llama-sycl-build/bin/llama-server \
-    --model /mnt/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf \
+    --model /mnt/models/gemma-4-26B-A4B-it-Q8_0.gguf \
     --device SYCL1 \
     -ngl 999 \
     -c 32768 \
